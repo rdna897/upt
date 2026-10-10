@@ -1039,12 +1039,22 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
         self.assertTrue(entered.wait(2))
 
         # The existing contract is one bounded join of exactly 6 s; a probe blocked
-        # past it keeps running. Wall-clock time is only a generous watchdog.
+        # past it keeps running. The spy times the real join so any other blocking
+        # in stop is measured directly, independent of how long the join took.
+        real_join, join_seconds = first.join, []
+        def timed_join(*args, **kwargs):
+            join_started = time.monotonic()
+            try:
+                return real_join(*args, **kwargs)
+            finally:
+                join_seconds.append(time.monotonic() - join_started)
         started = time.monotonic()
-        with mock.patch.object(first, "join", wraps=first.join) as join:
+        with mock.patch.object(first, "join", side_effect=timed_join) as join:
             self.service.stop_health_monitor()
-        self.assertLess(time.monotonic() - started, 30, "stop was not bounded")
+        elapsed = time.monotonic() - started
         join.assert_called_once_with(timeout=6)
+        self.assertLess(elapsed - join_seconds[0], 1.5, "stop blocked outside its bounded join")
+        self.assertLess(elapsed, 9, "stop exceeded the 6 s join bound plus CI tolerance")
         self.assertTrue(first.is_alive())
 
         # Existing defect E1 (issue #5): this start is currently a no-op that leaves no
