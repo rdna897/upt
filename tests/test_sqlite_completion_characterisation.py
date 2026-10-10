@@ -109,7 +109,7 @@ class OrdinaryUpdateHistoryFailureCurrentBehaviour(_Fixture):
                           old_image_id=EARLIER_ID, new_image="grafana/grafana:latest", new_image_id=OLD_ID,
                           backup=str(backup), result="SUCCESS")
         with sqlite_fault(self.state, history_insert(result="SUCCESS")), \
-                self.assertRaises(sqlite3.OperationalError):
+                self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
             self.update()
         self.assertEqual(self.docker, ["pull", "recreate"])
         self.assertEqual([r["result"] for r in self.state.history("grafana")], ["FAILED", "SUCCESS"])
@@ -140,6 +140,7 @@ class OrdinaryUpdateHistoryFailureCurrentBehaviour(_Fixture):
         self.assertEqual(self.docker, ["pull", "recreate"])
         # The service runs NEW_ID, yet nothing about the mutation is durable:
         # no History row, no rollback reference, no protection of OLD_ID.
+        # A fix that keeps evidence outside SQLite must also update this test.
         self.assertEqual(self.state.history(), [])
         self.assertNotIn(OLD_ID, self.state.protected())
 
@@ -271,7 +272,8 @@ class PinnedUpdateHistoryFailureCurrentBehaviour(_Fixture):
                 self.assertLogs("docker_update_manager.reconciliation", "WARNING"), \
                 self.assertRaisesRegex(sqlite3.OperationalError, "unable to open database file"):
             self.update()
-        # The compensating recreate still runs; neither outcome is durable.
+        # The compensating recreate still runs; neither outcome is durable in
+        # SQLite. A fix that keeps evidence elsewhere must also update this test.
         self.assertEqual(self.docker, ["pull", ("recreate", "new-pin"), ("recreate", "old-pin")])
         self.assertEqual(self.compose.read_text(), self.original)
         self.assertEqual(self.state.history(), [])

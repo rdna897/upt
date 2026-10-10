@@ -420,6 +420,8 @@ class WebRollbackReviewTests(unittest.TestCase):
                     "requested_by":"admin","client_ip":"127.0.0.1","user_agent":"tests"})
                 with self.agent._lock:
                     worker=self.agent._operation_threads.get(started["operation_id"])
+                # A missing worker has already finished: it is removed only in
+                # the worker's own finally block.
                 if worker is not None: worker.join(10)
                 self.assertFalse(worker is not None and worker.is_alive())
         self.assertEqual(len(injected.hits),1)
@@ -433,9 +435,9 @@ class WebRollbackReviewTests(unittest.TestCase):
         with self.assertLogs("docker_update_manager.webservice","ERROR"):
             operation,rollbacks=self.run_rollback_with_sqlite_fault(
                 history_insert(action="rollback",result="ROLLED BACK"))
-        # sqlite3.Error is outside do_web_rollback's recovery handler, so the web
-        # wrapper's stale-review fallback records the completed rollback as if
-        # nothing had changed.
+        # DEFECT encoded as current behaviour: sqlite3.Error is outside
+        # do_web_rollback's recovery handler, so the web wrapper's stale-review
+        # fallback records the completed rollback as if nothing had changed.
         self.assertEqual(operation["status"],"failed")
         self.assertEqual(operation["result"],{"manual_recovery_required":False,"recovered":False})
         (rollback,)=rollbacks
@@ -463,7 +465,8 @@ class WebRollbackReviewTests(unittest.TestCase):
             operation,rollbacks=self.run_rollback_with_sqlite_fault(
                 history_insert(action="rollback",result="ROLLED BACK"),mode="unavailable")
         # Nothing about the completed rollback is durable and the operation is
-        # never finished: it stays running after its worker has exited.
+        # never finished: it stays running after its worker has exited. A fix
+        # that keeps evidence outside SQLite must also update this test.
         self.assertEqual(rollbacks,[])
         self.assertEqual(operation["status"],"running")
 

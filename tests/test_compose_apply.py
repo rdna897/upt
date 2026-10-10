@@ -19,7 +19,7 @@ from docker_update_manager.lock import Lock
 from docker_update_manager.operation_presentation import operation_presentation
 from docker_update_manager.state import State
 from docker_update_manager.webapp import operation_event_role
-from docker_update_manager.webservice import AgentServer, ReadOnlyService, _public_service
+from docker_update_manager.webservice import COMPOSE_HISTORY_ATTEMPTS, AgentServer, ReadOnlyService, _public_service
 
 from progress_assertions import assert_stage_model
 from sqlite_faults import history_insert, sqlite_fault
@@ -762,21 +762,24 @@ class ComposeApplyTests(ComposeFixture):
         # first History insert and stays unavailable.
         result, payload, intent = self.start()
         with sqlite_fault(self.state, history_insert(action="compose_reconcile"), mode="unavailable") as fault, \
-                patch("docker_update_manager.webservice.time.sleep"), \
+                patch("docker_update_manager.webservice.time.sleep") as sleep, \
                 self.assertLogs("docker_update_manager.webservice", "ERROR"), \
                 self.assertRaisesRegex(sqlite3.OperationalError, "unable to open database file"):
             # The terminal write fails, the worker's fallback repeats the whole
             # finalisation once, and that failure escapes the worker thread.
             self.agent._compose_worker(result["operation_id"], payload, intent)
         self.assertEqual(len(fault.hits), 1)
+        # Two finalisation passes, each with the full bounded History retry.
+        self.assertEqual(sleep.call_count, 2 * (COMPOSE_HISTORY_ATTEMPTS - 1))
         self.assertEqual(len(self.fake.up_calls), 1)  # applied once; never reversed
         self.assertEqual(self.compose.read_bytes(), self.desired)
         self.assertEqual(self.state.history(), [])
         operation = self.agent.operation_status({"operation_id": result["operation_id"], "after_event_id": 0})
         # No durable History row, warning or terminal state: the operation is
-        # left running although the workload change is complete.
+        # left running although the workload change is complete. A fix that
+        # keeps evidence outside SQLite must also update this test.
         self.assertEqual(operation["status"], "running")
-        self.assertNotIn("warnings", operation.get("result") or {})
+        self.assertEqual(operation["result"], {})  # no warning was persisted
 
     def test_changed_bind_configuration_recovers_old_mount_then_restores_pending_source(self):
         self.edit("source: /srv/private/sonarr", "source: /srv/private/sonarr-new")

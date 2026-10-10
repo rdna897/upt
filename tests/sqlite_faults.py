@@ -4,15 +4,20 @@ Characterisation tests use this to make one real ``State`` write fail where a
 production SQLite failure would surface, without replacing ``State`` methods:
 
 * ``before_commit`` - the matching statement raises inside the write
-  transaction, so ``State.connect`` rolls it back and nothing is persisted
-  (for example ``database is locked`` after the busy timeout).
-* ``after_commit`` - the transaction containing the matching statement really
+  transaction, so ``State.connect`` rolls it back and nothing is persisted.
+  A busy timeout at ``BEGIN IMMEDIATE`` has the same caller-visible outcome;
+  the fault is placed on the statement because only it identifies which
+  ``State`` write is being targeted.
+* ``after_commit`` - the matching statement executes, the transaction really
   commits, then the commit acknowledgement raises (an ambiguous commit).
 * ``unavailable`` - the matching statement raises and, from then on, every new
   connection fails until the context exits (persistent unavailability).
 
 Statements are matched by a predicate over ``(sql, row)``, where ``row`` maps
-the column names of an ``INSERT`` to its parameters (empty for other SQL).
+the column names of an ``INSERT`` to its parameters (``{"params": ...}`` for
+other SQL). Only ``Connection.execute`` is intercepted, and an ``INSERT`` whose
+values are not all placeholders cannot be matched by column (``history_insert``
+fails loudly rather than mismatching it).
 """
 
 import re
@@ -27,8 +32,11 @@ def history_insert(**expected):
     """Match an ``INSERT INTO history`` whose named columns equal ``expected``."""
     def match(sql, row):
         found = _INSERT.match(sql)
-        return (bool(found) and found.group(1) == "history"
-                and all(row.get(key) == value for key, value in expected.items()))
+        if not found or found.group(1) != "history":
+            return False
+        if "unmapped" in row:
+            raise AssertionError("history_insert supports placeholder-only INSERTs: " + sql[:80])
+        return all(row.get(key) == value for key, value in expected.items())
     return match
 
 
@@ -53,8 +61,10 @@ class _Connection:
 
     def execute(self, sql, params=()):
         found = _INSERT.match(sql)
-        row = (dict(zip([name.strip() for name in found.group(2).split(",")], params))
-               if found else {"params": tuple(params)})
+        row = {"params": tuple(params)}
+        if found:
+            columns = [name.strip() for name in found.group(2).split(",")]
+            row = dict(zip(columns, params)) if len(columns) == len(params) else {"unmapped": sql}
         if self._fault.remaining and self._fault.match(sql, row):
             self._fault.remaining -= 1
             self._fault.hits.append(row)
