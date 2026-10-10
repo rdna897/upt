@@ -3,6 +3,7 @@
 import _upt_isolation  # noqa: F401 - must stay first; see scripts/run_tests.py
 import json
 import logging
+import shutil
 import socket
 import sqlite3
 import tempfile
@@ -751,9 +752,10 @@ class _StopServing(Exception):
 class RuntimeMonitorLifecycleTests(unittest.TestCase):
     """Phase 3 regressions for the agent-owned runtime monitor (no Docker, no network).
 
-    One cleanup owns teardown: it releases every gate, signals the monitor, joins
-    every thread the test spawned and only then removes the fail-closed guards and
-    the temporary state directory. If any thread survives, guards and state are
+    One cleanup owns teardown: it releases every gate, joins helper threads that
+    can still start a monitor, then signals and joins every monitor, and only then
+    removes the fail-closed guards and the temporary state directory. If any thread
+    survives, guards and state (an ``mkdtemp`` directory with no finalizer) are
     deliberately left in place so a live worker can never reach real Docker, the
     network or a deleted directory, and the test fails.
     """
@@ -762,7 +764,7 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
         self.release = Event()
         self.spawned, self._patchers, self.guards = [], [], {}
         self.service = None
-        self._tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self._tmp = tempfile.mkdtemp(dir="/tmp")
         self.addCleanup(self._teardown)
         for name, target in (("docker", "docker_update_manager.system.run"),
                              ("run", "subprocess.run"), ("popen", "subprocess.Popen"),
@@ -770,12 +772,17 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
             patcher = mock.patch(target, side_effect=AssertionError("live " + name + " call in test"))
             self.guards[name] = patcher.start()
             self._patchers.append(patcher)
-        self.root = Path(self._tmp.name)
+        self.root = Path(self._tmp)
         self.state = State(self.root / "state")
         self.service = ReadOnlyService(Config(path=str(self.root / "missing.yml")), self.state)
 
     def _teardown(self):
         self.release.set()
+        # Starter threads may still admit a monitor (clearing the stop event), so
+        # join them before signalling stop and collecting the monitors to join.
+        helpers = [thread for thread in self.spawned if thread.name != MONITOR_THREAD]
+        for thread in helpers:
+            thread.join(5)
         threads = set(self.spawned)
         if self.service is not None:
             self.service._health_stop.set()
@@ -783,12 +790,18 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
         threads.discard(None)
         for thread in threads:
             thread.join(5)
+        late = self.service._health_thread if self.service is not None else None
+        if late is not None and late not in threads:
+            # Fail-safe: a monitor admitted during teardown is still stopped and joined.
+            self.service._health_stop.set()
+            late.join(5)
+            threads.add(late)
         survivors = [thread.name for thread in threads if thread.is_alive()]
         if survivors:
             self.fail("threads outlived their test; guards and state retained: " + ", ".join(sorted(survivors)))
         for patcher in reversed(self._patchers):
             patcher.stop()
-        self._tmp.cleanup()
+        shutil.rmtree(self._tmp)
         for name in ("run", "popen", "network"):
             self.guards[name].assert_not_called()
 
