@@ -50,6 +50,30 @@ invent eligibility for them. Non-migrated rows without their own matching ref
 also survive the final prune. Normal expiry (including expired-but-in-use
 protection pruning), shared-image protection and purge idempotence are retained.
 
+## Image-level protection invariant
+
+A `protected_images` row is resolved by retention only through its own
+rollback ref (same `history_id` and `image_id`). Any other row (NULL-history
+manual recovery, ambiguous shared history, or a history whose ref names a
+different image) is unresolved and blocks removal of that image in normal,
+`--all` and dry-run cleanup, reported as `SKIPPED - UNRESOLVED PROTECTION`,
+even when other refs for the image have expired. Unique legacy candidates are
+not blocking because real cleanup materialises them first.
+
+Immediately before each `docker image rm`, a short `state.read()` revalidates
+the image (real cleanup also rechecks active refs, which earlier long Docker
+removals may have made stale). No transaction is held while Docker runs. The
+post-removal delete and the final prune only delete a protection that has its
+own ref and no active ref for the image, so a protection published during the
+removal window survives. The final prune retires resolved protections before
+terminal refs and keeps a terminal ref while a protection still names it, so a
+resolved point cannot be re-migrated as active on a later run.
+
+Residual: publication between the revalidation read and the Docker call can
+still race the removal itself; closing it would require holding SQLite across
+Docker, which R10 forbids. The resulting state stays protected and is
+reconciled as `ALREADY ABSENT` once its ref expires.
+
 ## Synthetic regression evidence
 
 `tests/test_retention_writer_contention.py` includes:
@@ -72,6 +96,13 @@ protection pruning), shared-image protection and purge idempotence are retained.
   equality, dry-run/real cleanup selection, repeated cleanup, and protected
   legacy images excluded from removal even with `--all`.
 - Matching history/image prune boundaries and normal expired-but-in-use behavior.
+- Unresolved NULL, ambiguous and mismatched protections blocking removal of
+  an image with an expired ref across dry-run, repeated real and `--all` runs.
+- Revalidation of refs published during an earlier image's Docker removal, and
+  of a protection published during the image's own removal.
+- PURGED/ALREADY ABSENT refs retiring with their protection over repeated runs
+  without resurrection, alongside retained NULL/ambiguous protections, and a
+  terminal ref kept while its protection still names a shared active image.
 - An injected accounting exception followed by a successful separate writer,
   guarding transaction release even on exceptions.
 

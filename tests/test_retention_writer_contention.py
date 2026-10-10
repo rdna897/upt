@@ -327,6 +327,161 @@ class RetentionWriterContentionTests(unittest.TestCase):
             self.assertEqual([tuple(row) for row in c.execute(
                 "SELECT expired,purge_status FROM rollback_refs")], [(1, "SKIPPED - IMAGE IN USE")])
 
+    def _expire_original_ref(self, *, purge_status="EXPIRED"):
+        with self.state.connect() as c:
+            c.execute("UPDATE rollback_refs SET created='2026-01-01 00:00:00',expired=1,purge_status=? "
+                      "WHERE history_id=?", (purge_status, self.original))
+
+    def _rows(self, query):
+        with self.state.read() as c:
+            return [tuple(row) for row in c.execute(query)]
+
+    def _assert_unresolved_protection_blocks_removal(self, protections):
+        when = datetime(2026, 1, 9, tzinfo=timezone.utc)
+        self._expire_original_ref()
+        with self.state.connect() as c:
+            c.execute("DELETE FROM protected_images")
+            c.executemany("INSERT INTO protected_images(image_id,reason,history_id,created) "
+                          "VALUES(?,'manual',?,'2026-01-01 00:00:00')", protections)
+        protected = self._rows("SELECT image_id,history_id FROM protected_images ORDER BY image_id")
+        refs_query = "SELECT history_id,image_id,expired FROM rollback_refs ORDER BY history_id"
+        refs = self._rows(refs_query)
+        blocked = {"image": "sha256:initial", "reason": "SKIPPED - UNRESOLVED PROTECTION"}
+        with patch("docker_update_manager.retention._docker_image_accounting", return_value={}), \
+             patch("docker_update_manager.retention._container_image_ids", return_value=set()), \
+             patch("docker_update_manager.retention._image_exists", return_value=True), \
+             patch("docker_update_manager.retention.run", return_value="") as run:
+            for options in ({"dry_run": True}, {}, {}, {"all_protected": True},
+                            {"all_protected": True, "dry_run": True}):
+                result = cleanup(self.cfg, self.state, now=when, **options)
+                self.assertIn(blocked, result["skipped"], options)
+                self.assertNotIn("sha256:initial",
+                                 [p["image_id"] for p in result["planned_images"]], options)
+                self.assertEqual(result["images_removed"], 0, options)
+            run.assert_not_called()
+        self.assertEqual(self._rows("SELECT image_id,history_id FROM protected_images ORDER BY image_id"),
+                         protected)
+        self.assertEqual(self._rows(refs_query), refs)
+        # The blocked ref stays expired but never reaches a terminal purge state.
+        self.assertEqual(self._rows(f"SELECT purge_status FROM rollback_refs WHERE history_id={self.original}"),
+                         [("MANUALLY EXPIRED",)])
+
+    def test_null_history_protection_blocks_expired_ref_removal(self):
+        self._assert_unresolved_protection_blocks_removal([("sha256:initial", None)])
+
+    def test_ambiguous_protection_blocks_expired_ref_removal(self):
+        self._assert_unresolved_protection_blocks_removal(
+            [("sha256:initial", 777), ("sha256:ambiguous", 777)])
+
+    def test_protection_for_other_images_ref_blocks_expired_ref_removal(self):
+        with self.state.connect() as c:
+            c.execute("INSERT INTO history(id,timestamp,service,action,result) "
+                      "VALUES(778,'2026-01-01 00:00:00','other','update','SUCCESS')")
+            c.execute("INSERT INTO rollback_refs(history_id,image_id,created,expired,purge_status) "
+                      "VALUES(778,'sha256:other','2026-01-01 00:00:00',1,'PURGED')")
+        self._assert_unresolved_protection_blocks_removal([("sha256:initial", 778)])
+
+    def test_removal_revalidates_refs_published_during_earlier_docker_removal(self):
+        when = datetime(2026, 1, 9, tzinfo=timezone.utc)
+        earlier = self.state.record(service="earlier", action="update", result="SUCCESS",
+                                    old_image_id="sha256:aaa")
+        with self.state.connect() as c:
+            c.execute("UPDATE rollback_refs SET created='2026-01-01 00:00:00'")
+        published = []
+
+        def docker(args, **_kwargs):
+            if args == ["docker", "image", "rm", "sha256:aaa"]:
+                # A concurrent update publishes a new active ref for the
+                # next image after cleanup computed its batch reference counts.
+                published.append(State(self.state.root).record(
+                    service="first", action="update", result="SUCCESS",
+                    old_image_id="sha256:initial"))
+            return ""
+
+        with patch("docker_update_manager.retention._docker_image_accounting", return_value={}), \
+             patch("docker_update_manager.retention._container_image_ids", return_value=set()), \
+             patch("docker_update_manager.retention.run", side_effect=docker) as run:
+            result = cleanup(self.cfg, self.state, now=when)
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [["docker", "image", "rm", "sha256:aaa"]])
+        self.assertEqual(result["images_removed"], 1)
+        self.assertIn({"image": "sha256:initial", "reason": "SKIPPED - SHARED ACTIVE ROLLBACK"},
+                      result["skipped"])
+        new_history, = published
+        self.assertEqual(self._rows("SELECT image_id,history_id FROM protected_images"),
+                         [("sha256:initial", new_history)])
+        self.assertEqual(self._rows(f"SELECT expired FROM rollback_refs WHERE history_id={new_history}"),
+                         [(0,)])
+        self.assertEqual(self._rows(f"SELECT purge_status FROM rollback_refs WHERE history_id={earlier}"),
+                         [("PURGED",)])
+
+    def test_protection_published_during_docker_removal_is_not_deleted(self):
+        when = datetime(2026, 1, 9, tzinfo=timezone.utc)
+        self._expire_original_ref()
+        published = []
+
+        def docker(args, **_kwargs):
+            # Publication lands after the final revalidation read but before
+            # cleanup's post-removal transaction.
+            published.append(State(self.state.root).record(
+                service="first", action="update", result="SUCCESS", old_image_id="sha256:initial"))
+            return ""
+
+        with patch("docker_update_manager.retention._docker_image_accounting", return_value={}), \
+             patch("docker_update_manager.retention._container_image_ids", return_value=set()), \
+             patch("docker_update_manager.retention.run", side_effect=docker):
+            cleanup(self.cfg, self.state, now=when)
+        new_history, = published
+        self.assertEqual(self._rows("SELECT image_id,history_id FROM protected_images"),
+                         [("sha256:initial", new_history)])
+        self.assertEqual(self._rows("SELECT history_id,expired FROM rollback_refs ORDER BY history_id"),
+                         [(self.original, 1), (new_history, 0)])
+
+    def _assert_resolved_ref_retires_with_protection(self, purge_status):
+        when = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        self._expire_original_ref(purge_status=purge_status)
+        with self.state.connect() as c:
+            # Unresolved protections for other images must survive the same prune.
+            c.execute("INSERT INTO protected_images(image_id,reason,history_id) VALUES('sha256:manual','manual',NULL)")
+            c.execute("INSERT INTO protected_images(image_id,reason,history_id) VALUES('sha256:dup-a','legacy',900)")
+            c.execute("INSERT INTO protected_images(image_id,reason,history_id) VALUES('sha256:dup-b','legacy',900)")
+        with patch("docker_update_manager.retention._docker_image_accounting", return_value={}), \
+             patch("docker_update_manager.retention._container_image_ids", return_value=set()), \
+             patch("docker_update_manager.retention.run", return_value="") as run:
+            for _ in range(3):
+                cleanup(self.cfg, self.state, now=when)
+                self.assertEqual(self._rows("SELECT * FROM rollback_refs"), [])
+                self.assertEqual(
+                    self._rows("SELECT image_id,history_id FROM protected_images ORDER BY image_id"),
+                    [("sha256:dup-a", 900), ("sha256:dup-b", 900), ("sha256:manual", None)])
+            run.assert_not_called()
+
+    def test_purged_ref_and_its_protection_retire_without_resurrection(self):
+        self._assert_resolved_ref_retires_with_protection("PURGED")
+
+    def test_already_absent_ref_and_its_protection_retire_without_resurrection(self):
+        self._assert_resolved_ref_retires_with_protection("ALREADY ABSENT")
+
+    def test_resolved_ref_still_named_by_protection_is_kept_while_image_shared(self):
+        when = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        self._expire_original_ref(purge_status="PURGED")
+        with self.state.connect() as c:
+            c.execute("INSERT INTO history(id,timestamp,service,action,result) "
+                      "VALUES(901,'2026-02-28 00:00:00','second','update','SUCCESS')")
+            c.execute("INSERT INTO rollback_refs(history_id,image_id,created,expired) "
+                      "VALUES(901,'sha256:initial','2026-02-28 00:00:00',0)")
+        with patch("docker_update_manager.retention._docker_image_accounting", return_value={}), \
+             patch("docker_update_manager.retention._container_image_ids", return_value=set()), \
+             patch("docker_update_manager.retention.run", return_value="") as run:
+            for _ in range(3):
+                cleanup(self.cfg, self.state, now=when)
+                self.assertEqual(
+                    self._rows("SELECT history_id,expired,purge_status FROM rollback_refs ORDER BY history_id"),
+                    [(self.original, 1, "PURGED"), (901, 0, None)])
+                self.assertEqual(self._rows("SELECT image_id,history_id FROM protected_images"),
+                                 [("sha256:initial", self.original)])
+            run.assert_not_called()
+
     def test_accounting_exception_does_not_leave_writer_locked(self):
         with patch("docker_update_manager.retention._docker_image_accounting",
                    side_effect=RuntimeError("synthetic accounting failure")):
