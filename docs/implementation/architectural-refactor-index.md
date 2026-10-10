@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | 1 | Full-scan worker separation (`scan_worker.py`); facade retains bounded scheduling and RPC | Included in the public baseline |
 | 2 | Exact-container targeted verification method with real-worker regression tests | [PR #2](https://github.com/rdna897/upt/pull/2), merged |
+| 3 | Runtime health/snapshot coordination: Option A, tests only; extraction recorded as not warranted (`RuntimeMonitorLifecycleTests`, no `src/` change) | [Specification](phase3-runtime-health-snapshot.md) ([PR #4](https://github.com/rdna897/upt/pull/4)); tests [PR #7](https://github.com/rdna897/upt/pull/7), merged at `f50eb5e`. Deferred defects: [#5](https://github.com/rdna897/upt/issues/5), [#6](https://github.com/rdna897/upt/issues/6) |
 
 The repository-policy safeguards are tracked separately in [PR #1](https://github.com/rdna897/upt/pull/1); they are not a refactoring stage.
 
@@ -17,10 +18,10 @@ The repository-policy safeguards are tracked separately in [PR #1](https://githu
 
 | Stage | Candidate boundary | Gate |
 | --- | --- | --- |
-| 3 | Runtime health/snapshot coordination; evaluate extraction versus tests-only | [Phase 3 specification](phase3-runtime-health-snapshot.md), [issue #3](https://github.com/rdna897/upt/issues/3); owner approved Option A (tests only; extraction not warranted); tests-only implementation PR open for owner acceptance (`RuntimeMonitorLifecycleTests`, no `src/` change). Deferred defects: [#5](https://github.com/rdna897/upt/issues/5), [#6](https://github.com/rdna897/upt/issues/6) |
-| 4 | Compose observation/eligibility versus mutating/trust authority | Needs separate public-safe specification and owner-approved boundary |
-| 5 | Update, rollback and Compose mutation coordination | Needs separate design/implementation reviews |
-| 6 | SQLite state boundaries without fragmenting transactions | Evaluate transaction ownership **before** accepting detailed Stage 4/5 designs; include runtime-snapshot ordering debt ([#6](https://github.com/rdna897/upt/issues/6)) |
+| 6a | SQLite state and transaction ownership **assessment** (brought forward from Stage 6 as a prerequisite for Stages 4/5) | [Draft assessment](stage6-sqlite-state-ownership-review.md); owner decisions G1–G4 required. Assessment only; not Stage 6 implementation |
+| 4 | Compose observation/eligibility versus mutating/trust authority | Needs separate public-safe specification and owner-approved boundary; must cite the Stage 6 transaction contract once G1 is accepted |
+| 5 | Update, rollback and Compose mutation coordination | Needs separate design/implementation reviews; depends on Stage 6 gates G2–G4 (durable completion policy, CLI intent, rollback-point ownership) |
+| 6 | SQLite state boundaries without fragmenting transactions | Assessment performed early as 6a; any implementation needs separate approval and includes runtime-snapshot ordering debt ([#6](https://github.com/rdna897/upt/issues/6)) |
 | 7 | Web request adapters and presentation boundaries | Preserve auth, CSRF, sessions, SSE and wire contracts |
 | 8 | Combined integration, security, compatibility and release-readiness closure | Full clean-tree CI, isolated rehearsal, rollback evidence and separate deployment approval |
 
