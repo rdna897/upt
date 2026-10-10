@@ -18,7 +18,7 @@ The repository-policy safeguards are tracked separately in [PR #1](https://githu
 
 | Stage | Candidate boundary | Gate |
 | --- | --- | --- |
-| 6a | SQLite state and transaction ownership **assessment** (brought forward from Stage 6 as a prerequisite for Stages 4/5) | [Draft assessment](stage6-sqlite-state-ownership-review.md); owner decisions G1–G4 required. Assessment only; not Stage 6 implementation |
+| 6a | SQLite state and transaction ownership **assessment** (brought forward from Stage 6 as a prerequisite for Stages 4/5) | [Draft assessment](stage6-sqlite-state-ownership-review.md); owner decisions G1–G5 required. Assessment only; not Stage 6 implementation |
 | 4 | Compose observation/eligibility versus mutating/trust authority | Needs separate public-safe specification and owner-approved boundary; must cite the Stage 6 transaction contract once G1 is accepted |
 | 5 | Update, rollback and Compose mutation coordination | Needs separate design/implementation reviews; depends on Stage 6 gates G2–G4 (durable completion policy, CLI intent, rollback-point ownership) |
 | 6 | SQLite state boundaries without fragmenting transactions | Assessment performed early as 6a; any implementation needs separate approval and includes runtime-snapshot ordering debt ([#6](https://github.com/rdna897/upt/issues/6)) |
