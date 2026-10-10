@@ -185,10 +185,36 @@ Recorded 2026-10-10 after independent review of commit `e7aa0f97127265a9646d2a5b
 
 Phase 3 tests may reproduce and document E1–E5 but must not assert them as desired long-term behaviour.
 
+## Implementation evidence (tests-only PR)
+
+Recorded for owner review; Phase 3 is **not** closed until the owner accepts the implementation PR.
+
+- **Production code:** unchanged (`git diff --stat main...HEAD -- src/` is empty). Only `tests/test_runtime_health.py` and this closeout/roadmap documentation change.
+- **New class:** `RuntimeMonitorLifecycleTests`, nine tests covering the seven required groups:
+
+| Group | Test(s) | Contract proven |
+| --- | --- | --- |
+| 1 Parallel admission | `test_parallel_starts_admit_exactly_one_monitor_with_one_initial_tick` | 8 barrier-released starts all complete without raising and admit one daemon `upt-runtime-health` thread; exactly one initial probe and refresh; idle stop is prompt |
+| 2 Cached health | `test_health_rpc_serves_cached_copy_while_docker_probe_is_blocked`, `test_docker_probe_failure_projection_is_safe` | `handle("health")` returns promptly from cache while the real `_docker_health` is blocked at the exact `docker version` argv/10 s timeout boundary; returned dicts are copies; failure projection hides error text |
+| 3 Success → failure → recovery | `test_runtime_success_classified_failure_and_recovery_through_facade` | Classified and unexpected failures (`docker_unavailable`, `probe_failed`) retain the last payload and capture time; `attempted_at <= captured_at`; current/stale/unavailable status; no secret in logs or payload |
+| 4 Persistence failures | `test_persistence_failures_leave_previous_row_untouched` | Failed save or failure-record leaves the SQLite row byte-identical, never records a false failure, logs only safe class names |
+| 5 Monitor vs `reconcile_runtime` | `test_late_monitor_success_cannot_overwrite_newer_reconciliation`, `test_late_monitor_failure_cannot_overwrite_newer_reconciliation` | A real monitor tick blocked after capturing `attempted_at` publishes after a newer reconciliation; reconciliation snapshot and verification invalidation survive |
+| 6 Stop during blocked probe | `test_stop_during_blocked_probe_is_bounded_and_never_duplicates_monitor` | Stop performs exactly one `join(timeout=6)` (spied on the real thread and timed: stop may spend < 1.5 s outside the join and < 9 s in total); a restart never yields two live monitors; the stopped thread exits after release and publishes at most once. E1/E2 are reproduced and commented, not asserted as desired behaviour |
+| 7 Agent server wiring | `test_agent_server_checks_schema_before_socket_and_owns_monitor_lifecycle` | Order is schema check (before socket) → monitor start (socket bound) → accept → monitor stop in `finally`; socket removed and monitor joined |
+
+- **Isolation:** each test patches `docker_update_manager.system.run`, `subprocess.run`, `subprocess.Popen` and `urllib.request.urlopen` to fail closed. A single cleanup releases all gates, joins starter threads first (they could still admit a monitor; any starter still alive after that join is treated as a survivor even if it finishes later), then sets the monitor stop event and joins every monitor, including one admitted during teardown, before removing the guards and the temporary directory. The directory is created with `mkdtemp` (no garbage-collection finalizer); if any thread survives, guards and state are deliberately retained and the test fails. It then asserts no guard was hit. Runs under `scripts/run_tests.py` isolation with no ledger violations.
+- **Mutation check (local, reverted):** each of ten deliberate production mutations failed at least one new test: un-copied health cache; removed admission alive-check; concurrent start raising instead of returning; removed ordering guard; monitor started before schema check; save failure recorded as probe failure; raw exception text logged; join bound shortened to 1 s and to 5.75 s; runtime refresh skipped.
+- **Independent review:** GPT-6.1-Sol (Codex, extra-high reasoning), read-only. Round 1 requested changes: (High) cleanup could abort before joining every worker and then drop guards/state; (Medium) starter-thread exceptions could not fail the admission test; (Medium) the wall-clock stop assertion accepted a shortened join and could flake. All three were remediated as described above. Round 2 confirmed findings 2–3 resolved and found two remaining teardown gaps: (High) a delayed starter could admit a monitor after teardown had snapshotted its threads; (Medium) the `TemporaryDirectory` finalizer could delete retained state at garbage collection. Both were remediated (join starters before collecting monitors; `mkdtemp` with explicit removal). Round 3 confirmed retention and findings 2–3 resolved and found one residual edge: a starter outliving both joins could admit a monitor after the final snapshot and exit before the survivor check. Remediated by recording starters still alive after the starter-join phase as survivors. Each scenario was reproduced as fixed with scratch probes under the isolation runner.
+- **Local validation (Python 3.13):** the new class passed 10 consecutive runs (about 6 s each, dominated by the existing 6 s join in group 6). Related suites passed unmodified: `test_runtime_health`, `test_web_runtime`, `test_post_mutation_reconciliation`, `test_version_contract`, `test_web_ux_hardening`, `test_schema_compatibility_boundary`, `test_web_rollback`, `test_web_foundation`, `test_targeted_verification_worker`, `test_web_remediation` (205 tests, 3 environment skips).
+- **Limitations:** E1–E5 remain as tracked in #5 and #6. Group 6 necessarily spends the existing 6 s join bound once.
+- **Exact-head CI and independent review:** recorded on the implementation PR.
+
 ## Deliverables, gates and freeze
 
-**This PR:** documents the Phase 3 review, decision and acceptance criteria only. It makes no runtime/code/test changes.
+**Architecture decision ([PR #4](https://github.com/rdna897/upt/pull/4), merged):** recorded this review, the Option A decision (D1), the E1–E5 tracking arrangements (D2/D3, issues #5 and #6) and the acceptance criteria. Documentation only.
 
-**Implementation (approved, D1):** one separate narrowly scoped tests-only PR against the then-current public `main`, meeting the acceptance criteria above, with separate owner merge approval. Do not merge automatically. Phase 3 is not complete until the owner accepts that PR's outcome.
+**Implementation ([PR #7](https://github.com/rdna897/upt/pull/7), tests only):** adds `RuntimeMonitorLifecycleTests` to `tests/test_runtime_health.py` and this closeout evidence. Production source under `src/` is unchanged.
+
+**Completion:** Phase 3 is complete only after the owner accepts and merges PR #7. Do not merge automatically.
 
 **Freeze:** never install, rebuild, restart or redeploy UPT; never change production Compose, Docker, SQLite, secrets, caches or snapshots. Completion or merge of Phase 3 is not permission for a release or production deployment.
