@@ -783,6 +783,9 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
         helpers = [thread for thread in self.spawned if thread.name != MONITOR_THREAD]
         for thread in helpers:
             thread.join(5)
+        # A helper still alive here could admit a monitor after the snapshot below
+        # and then exit, so it counts as a survivor even if it finishes later.
+        escaped = [thread.name for thread in helpers if thread.is_alive()]
         threads = set(self.spawned)
         if self.service is not None:
             self.service._health_stop.set()
@@ -796,7 +799,7 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
             self.service._health_stop.set()
             late.join(5)
             threads.add(late)
-        survivors = [thread.name for thread in threads if thread.is_alive()]
+        survivors = escaped + [thread.name for thread in threads if thread.is_alive()]
         if survivors:
             self.fail("threads outlived their test; guards and state retained: " + ", ".join(sorted(survivors)))
         for patcher in reversed(self._patchers):
