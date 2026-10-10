@@ -482,6 +482,52 @@ class RetentionWriterContentionTests(unittest.TestCase):
                                  [("sha256:initial", self.original)])
             run.assert_not_called()
 
+    def _assert_terminal_prune_fixture(self, *, refs, protections, expected_refs, expected_protections):
+        # After the 30-day resolved-metadata cutoff for the 2026-01-01 refs.
+        when = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        with self.state.connect() as c:
+            c.execute("DELETE FROM rollback_refs")
+            c.execute("DELETE FROM protected_images")
+            c.executemany("INSERT INTO rollback_refs(history_id,image_id,created,expired,purge_status) "
+                          "VALUES(?,?,'2026-01-01 00:00:00',1,?)", refs)
+            c.executemany("INSERT INTO protected_images(image_id,reason,history_id,created) "
+                          "VALUES(?,'legacy',?,'2026-01-01 00:00:00')", protections)
+        refs_query = "SELECT history_id,image_id,expired,purge_status FROM rollback_refs ORDER BY history_id"
+        protected_query = "SELECT image_id,history_id FROM protected_images ORDER BY image_id"
+        with patch("docker_update_manager.retention._docker_image_accounting", return_value={}), \
+             patch("docker_update_manager.retention._container_image_ids", return_value=set()), \
+             patch("docker_update_manager.retention._image_exists", return_value=True), \
+             patch("docker_update_manager.retention.run", return_value="") as run:
+            for attempt in range(3):
+                preview = cleanup(self.cfg, self.state, now=when, dry_run=True)
+                self.assertEqual(preview["planned_images"], [], attempt)
+                result = cleanup(self.cfg, self.state, now=when)
+                self.assertEqual(result["images_removed"], 0, attempt)
+                self.assertEqual(self._rows(refs_query), expected_refs, attempt)
+                self.assertEqual(self._rows(protected_query), expected_protections, attempt)
+            run.assert_not_called()
+
+    def test_terminal_ref_kept_while_unresolved_protection_shares_history_with_other_image(self):
+        self._assert_terminal_prune_fixture(
+            refs=[(17, "sha256:other", "PURGED")],
+            protections=[("sha256:protected", 17)],
+            expected_refs=[(17, "sha256:other", 1, "PURGED")],
+            expected_protections=[("sha256:protected", 17)])
+
+    def test_retiring_matching_shared_history_protection_keeps_remainder_ineligible(self):
+        self._assert_terminal_prune_fixture(
+            refs=[(21, "sha256:matched", "ALREADY ABSENT")],
+            protections=[("sha256:matched", 21), ("sha256:unresolved", 21)],
+            expected_refs=[(21, "sha256:matched", 1, "ALREADY ABSENT")],
+            expected_protections=[("sha256:unresolved", 21)])
+
+    def test_terminal_refs_without_dependent_protection_still_retire(self):
+        self._assert_terminal_prune_fixture(
+            refs=[(31, "sha256:resolved", "PURGED"), (32, "sha256:unprotected", "ALREADY ABSENT")],
+            protections=[("sha256:resolved", 31), ("sha256:manual", None)],
+            expected_refs=[],
+            expected_protections=[("sha256:manual", None)])
+
     def test_accounting_exception_does_not_leave_writer_locked(self):
         with patch("docker_update_manager.retention._docker_image_accounting",
                    side_effect=RuntimeError("synthetic accounting failure")):

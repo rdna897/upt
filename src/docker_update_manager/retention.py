@@ -319,12 +319,13 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
             before=c.total_changes
             c.execute("DELETE FROM disk_snapshots WHERE timestamp<?",(disk_cutoff,))
             # Retire resolved protections before their terminal refs, and keep a
-            # terminal ref while a protection still names it; otherwise the
-            # orphaned protection would be re-migrated as an active ref.
+            # terminal ref while any protection still uses its history_id (even
+            # for another image): that occupied ID is what keeps the remaining
+            # protection from being re-migrated as an active, expirable ref.
             c.execute("DELETE FROM protected_images WHERE "+_resolved_protection())
             c.execute("DELETE FROM rollback_refs WHERE expired=1 AND purge_status IN ('PURGED','ALREADY ABSENT') AND created<? "
-                      "AND NOT EXISTS (SELECT 1 FROM protected_images p WHERE p.history_id=rollback_refs.history_id "
-                      "AND p.image_id=rollback_refs.image_id)",(resolved_cutoff,))
+                      "AND NOT EXISTS (SELECT 1 FROM protected_images p WHERE p.history_id=rollback_refs.history_id)",
+                      (resolved_cutoff,))
             c.execute("DELETE FROM history WHERE timestamp<? AND id NOT IN (SELECT history_id FROM rollback_refs)",(audit_cutoff,))
             c.execute("PRAGMA optimize")
             result["database"]["rows_pruned"]=c.total_changes-before

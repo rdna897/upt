@@ -66,8 +66,14 @@ removals may have made stale). No transaction is held while Docker runs. The
 post-removal delete and the final prune only delete a protection that has its
 own ref and no active ref for the image, so a protection published during the
 removal window survives. The final prune retires resolved protections before
-terminal refs and keeps a terminal ref while a protection still names it, so a
-resolved point cannot be re-migrated as active on a later run.
+terminal refs and keeps a terminal (`PURGED`/`ALREADY ABSENT`) ref while any
+protection still uses its `history_id`, even one naming a different image or a
+shared-history sibling of a retired protection. That occupied ID is what
+excludes the remaining protection from legacy migration, so an unresolved
+protection never becomes an active, expirable rollback point merely because
+retention pruned another record. Such terminal refs outlive the
+resolved-metadata cutoff until the protection is handled explicitly; terminal
+refs with no dependent protection still retire normally.
 
 Residual: publication between the revalidation read and the Docker call can
 still race the removal itself; closing it would require holding SQLite across
@@ -103,6 +109,11 @@ reconciled as `ALREADY ABSENT` once its ref expires.
 - PURGED/ALREADY ABSENT refs retiring with their protection over repeated runs
   without resurrection, alongside retained NULL/ambiguous protections, and a
   terminal ref kept while its protection still names a shared active image.
+- Full `cleanup()` runs past the metadata cutoff for a terminal ref sharing its
+  history ID with an unresolved protection for another image, and for a
+  shared-history pair where only one protection matches the terminal ref: the
+  ref is kept, the unresolved protection is unchanged, never migrated and its
+  image never removed; terminal refs without dependent protections still retire.
 - An injected accounting exception followed by a successful separate writer,
   guarding transaction release even on exceptions.
 
