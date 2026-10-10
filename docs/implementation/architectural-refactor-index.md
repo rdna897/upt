@@ -17,7 +17,7 @@ The repository-policy safeguards are tracked separately in [PR #1](https://githu
 
 | Stage | Candidate boundary | Gate |
 | --- | --- | --- |
-| 3 | Runtime health/snapshot coordination; evaluate extraction versus tests-only | [Draft Phase 3 specification](phase3-runtime-health-snapshot.md), [issue #3](https://github.com/rdna897/upt/issues/3); architecture review first |
+| 3 | Runtime health/snapshot coordination; evaluate extraction versus tests-only | [Draft Phase 3 specification](phase3-runtime-health-snapshot.md), [issue #3](https://github.com/rdna897/upt/issues/3); architecture review complete, recommends tests-only (Option A); awaiting owner decision |
 | 4 | Compose observation/eligibility versus mutating/trust authority | Needs separate public-safe specification and owner-approved boundary |
 | 5 | Update, rollback and Compose mutation coordination | Needs separate design/implementation reviews |
 | 6 | SQLite state boundaries without fragmenting transactions | Evaluate transaction ownership **before** accepting detailed Stage 4/5 designs |
