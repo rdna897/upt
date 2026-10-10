@@ -58,6 +58,10 @@ protection pruning), shared-image protection and purge idempotence are retained.
   separate `State` instance must commit a history write **before**
   accounting is released. The inventory result remains the earlier snapshot.
   All test threads have bounded waits and `finally` cleanup.
+- Real cleanup paused during accounting while a separate main-thread writer
+  commits an active ref for the same image as an expired snapshot ref. Cleanup
+  rechecks active refs, reports `SKIPPED - SHARED ACTIVE ROLLBACK`, never removes
+  the image, and leaves the new ref active.
 - A legacy protection reference missing `rollback_refs`, proving that plain
   inventory and retention dry-run expose it without calling `state.connect`
   or inserting a reference.

@@ -4,7 +4,6 @@ All state and Docker input is synthetic; the guarded test runner is mandatory.
 """
 import _upt_isolation  # noqa: F401 - must stay first; see scripts/run_tests.py
 
-import sqlite3
 import tempfile
 import threading
 import unittest
@@ -96,6 +95,63 @@ class RetentionWriterContentionTests(unittest.TestCase):
         # not re-read after the concurrent writer completed.
         self.assertEqual([r["history_id"] for r in observed], [self.original])
         self.assertEqual(len(self.state.history()), 2)
+
+    def test_real_cleanup_preserves_active_ref_committed_during_accounting(self):
+        when = datetime(2026, 1, 9, tzinfo=timezone.utc)
+        image = "sha256:initial"
+        with self.state.connect() as c:
+            c.execute("UPDATE rollback_refs SET created='2026-01-01 00:00:00', "
+                      "expired=1,purge_status='EXPIRED' WHERE history_id=?", (self.original,))
+        accounting_started = threading.Event()
+        release_accounting = threading.Event()
+        errors = []
+        observed = []
+
+        def blocked_accounting():
+            accounting_started.set()
+            self.assertTrue(release_accounting.wait(10), "accounting release was not signalled")
+            return {}
+
+        def cleanup_worker():
+            try:
+                observed.append(cleanup(self.cfg, self.state, now=when))
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=cleanup_worker, daemon=True)
+        with patch("docker_update_manager.retention._docker_image_accounting",
+                   side_effect=blocked_accounting), \
+             patch("docker_update_manager.retention._container_image_ids", return_value=set()), \
+             patch("docker_update_manager.retention.run", return_value="") as run:
+            worker.start()
+            try:
+                self.assertTrue(accounting_started.wait(5), "cleanup did not reach accounting")
+                # This distinct connection must commit while accounting is
+                # blocked, proving cleanup holds no SQLite writer reservation.
+                with State(self.state.root).connect() as c:
+                    new_history = c.execute(
+                        "INSERT INTO history(timestamp,stack,service,action,result) "
+                        "VALUES('2026-01-08 00:00:00','synthetic','second','update','SUCCESS')"
+                    ).lastrowid
+                    c.execute("INSERT INTO rollback_refs(history_id,image_id,created,expired) "
+                              "VALUES(?,?,'2026-01-08 00:00:00',0)", (new_history, image))
+                self.assertFalse(release_accounting.is_set())
+                self.assertTrue(worker.is_alive())
+            finally:
+                release_accounting.set()
+                worker.join(timeout=5)
+            self.assertFalse(worker.is_alive(), "cleanup thread did not exit")
+            self.assertEqual(errors, [])
+            run.assert_not_called()
+        result, = observed
+        self.assertEqual(result["skipped"],
+                         [{"image": image, "reason": "SKIPPED - SHARED ACTIVE ROLLBACK"}])
+        self.assertEqual(result["images_removed"], 0)
+        with self.state.read() as c:
+            self.assertEqual(c.execute("SELECT expired FROM rollback_refs WHERE history_id=?",
+                                       (new_history,)).fetchone()[0], 0)
+            self.assertEqual(c.execute("SELECT expired FROM rollback_refs WHERE history_id=?",
+                                       (self.original,)).fetchone()[0], 1)
 
     def test_inventory_and_dry_run_project_legacy_refs_without_any_write(self):
         with self.state.connect() as c:
