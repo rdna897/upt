@@ -1,0 +1,9 @@
+# Review routing only. GitHub branch rules determine whether approval is required.
+# Owner of general source changes.
+/ @rdna897
+
+# Pay particular attention to CI, workflows and repository governance.
+/.github/ @rdna897
+/scripts/ci/ @rdna897
+/AGENTS.md @rdna897
+/docs/development-policy.md @rdna897
