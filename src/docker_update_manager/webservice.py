@@ -680,6 +680,25 @@ class ReadOnlyService:
         return {"status": "checking" if checking else ("failed" if record and record.get("failed_at") and not record.get("invalidated") else "idle"),
                 "record": record}
 
+    def _verify_exact_container_once(self, service_key, started_at):
+        found = [service for service in discover(self.config)
+                 if f"container/{service.container_id}" == service_key]
+        if len(found) != 1:
+            return
+        service = found[0]
+        public = _public_service(service)
+        identity = verification_identity(public)
+        try:
+            result = _public_result(scan_service_with_tracking(service, self.state), self.state)
+        except Exception as exc:
+            result = {"service": public, "status": "REGISTRY ERROR", "error": _safe_error(exc)}
+        # Replacement during a registry query cannot produce
+        # current evidence for this exact container key.
+        current = [item for item in discover(self.config) if item.container_id == service.container_id]
+        if len(current) != 1 or verification_identity(_public_service(current[0])) != identity:
+            return
+        self.state.save_verification(result, started_at=started_at)
+
     def _refresh_worker(self, service_key, wait_for_scan=False):
         try:
             while True:
@@ -688,23 +707,7 @@ class ReadOnlyService:
                         started_at = datetime.now(timezone.utc).isoformat()
                         with self._lock:
                             self._refresh_started_at[service_key] = started_at
-                        found = [service for service in discover(self.config)
-                                 if f"container/{service.container_id}" == service_key]
-                        if len(found) != 1:
-                            return
-                        service = found[0]
-                        public = _public_service(service)
-                        identity = verification_identity(public)
-                        try:
-                            result = _public_result(scan_service_with_tracking(service, self.state), self.state)
-                        except Exception as exc:
-                            result = {"service": public, "status": "REGISTRY ERROR", "error": _safe_error(exc)}
-                        # Replacement during a registry query cannot produce
-                        # current evidence for this exact container key.
-                        current = [item for item in discover(self.config) if item.container_id == service.container_id]
-                        if len(current) != 1 or verification_identity(_public_service(current[0])) != identity:
-                            return
-                        self.state.save_verification(result, started_at=started_at)
+                        self._verify_exact_container_once(service_key, started_at)
                         return
                 if not wait_for_scan:
                     return
