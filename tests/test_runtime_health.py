@@ -751,40 +751,50 @@ class _StopServing(Exception):
 class RuntimeMonitorLifecycleTests(unittest.TestCase):
     """Phase 3 regressions for the agent-owned runtime monitor (no Docker, no network).
 
-    Fail-closed guards stay patched until every monitor thread a test started has
-    been released and joined: cleanups run LIFO, so ``_stop_monitors`` (registered
-    last) runs before the guards and the temporary state directory are removed.
+    One cleanup owns teardown: it releases every gate, signals the monitor, joins
+    every thread the test spawned and only then removes the fail-closed guards and
+    the temporary state directory. If any thread survives, guards and state are
+    deliberately left in place so a live worker can never reach real Docker, the
+    network or a deleted directory, and the test fails.
     """
 
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(dir="/tmp")
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
-        self.state = State(self.root / "state")
-        self.service = ReadOnlyService(Config(path=str(self.root / "missing.yml")), self.state)
         self.release = Event()
-        self.guards = {}
+        self.spawned, self._patchers, self.guards = [], [], {}
+        self.service = None
+        self._tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(self._teardown)
         for name, target in (("docker", "docker_update_manager.system.run"),
                              ("run", "subprocess.run"), ("popen", "subprocess.Popen"),
                              ("network", "urllib.request.urlopen")):
             patcher = mock.patch(target, side_effect=AssertionError("live " + name + " call in test"))
             self.guards[name] = patcher.start()
-            self.addCleanup(patcher.stop)
-        self.monitors = []
-        self.addCleanup(self._stop_monitors)
+            self._patchers.append(patcher)
+        self.root = Path(self._tmp.name)
+        self.state = State(self.root / "state")
+        self.service = ReadOnlyService(Config(path=str(self.root / "missing.yml")), self.state)
 
-    def _stop_monitors(self):
+    def _teardown(self):
         self.release.set()
-        self.service.stop_health_monitor()
-        for thread in {*self.monitors, self.service._health_thread} - {None}:
+        threads = set(self.spawned)
+        if self.service is not None:
+            self.service._health_stop.set()
+            threads.add(self.service._health_thread)
+        threads.discard(None)
+        for thread in threads:
             thread.join(5)
-            self.assertFalse(thread.is_alive(), "runtime monitor outlived its test")
+        survivors = [thread.name for thread in threads if thread.is_alive()]
+        if survivors:
+            self.fail("threads outlived their test; guards and state retained: " + ", ".join(sorted(survivors)))
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+        self._tmp.cleanup()
         for name in ("run", "popen", "network"):
             self.guards[name].assert_not_called()
 
     def _start(self, interval_seconds=30):
         self.service.start_health_monitor(interval_seconds=interval_seconds)
-        self.monitors.append(self.service._health_thread)
+        self.spawned.append(self.service._health_thread)
         return self.service._health_thread
 
     def _blocking_docker_version(self, entered, version="27.1.0"):
@@ -818,17 +828,24 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
         probes = []
         self.service._docker_health = lambda: probes.append(1) or {"ok": True, "version": "fixture"}
         refreshes, refreshed = self._record_refreshes()
-        barrier = threading.Barrier(8)
+        barrier, completed, errors = threading.Barrier(8), [], []
         def start():
-            barrier.wait(5)
-            self.service.start_health_monitor(interval_seconds=30)
+            try:
+                barrier.wait(5)
+                self.assertIsNone(self.service.start_health_monitor(interval_seconds=30))
+                completed.append(threading.current_thread())
+            except BaseException as exc:  # surfaced below; a raised start is not an admission
+                errors.append(type(exc).__name__)
         starters = [threading.Thread(target=start) for _ in range(8)]
+        self.spawned.extend(starters)
         for starter in starters:
             starter.start()
         for starter in starters:
             starter.join(5)
-            self.assertFalse(starter.is_alive())
-        self.monitors.append(self.service._health_thread)
+        self.spawned.append(self.service._health_thread)
+        self.assertEqual(errors, [])
+        self.assertFalse(any(starter.is_alive() for starter in starters))
+        self.assertEqual(len(completed), 8, "not every concurrent start completed")
 
         self.assertTrue(refreshed.wait(2), "first tick did not run promptly")
         self.assertEqual(self._live_monitors(), [self.service._health_thread])
@@ -1005,12 +1022,13 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
         first = self._start()
         self.assertTrue(entered.wait(2))
 
+        # The existing contract is one bounded join of exactly 6 s; a probe blocked
+        # past it keeps running. Wall-clock time is only a generous watchdog.
         started = time.monotonic()
-        self.service.stop_health_monitor()
-        elapsed = time.monotonic() - started
-        # The existing join bound is 6 s; a probe blocked past it keeps running.
-        self.assertGreaterEqual(elapsed, 5.5)
-        self.assertLess(elapsed, 7.5)
+        with mock.patch.object(first, "join", wraps=first.join) as join:
+            self.service.stop_health_monitor()
+        self.assertLess(time.monotonic() - started, 30, "stop was not bounded")
+        join.assert_called_once_with(timeout=6)
         self.assertTrue(first.is_alive())
 
         # Existing defect E1 (issue #5): this start is currently a no-op that leaves no
@@ -1038,7 +1056,7 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
         def start_monitor(*args, **kwargs):
             events.append(("start", socket_path.exists()))
             result = start(*args, **kwargs)
-            self.monitors.append(self.service._health_thread)
+            self.spawned.append(self.service._health_thread)
             return result
         def stop_monitor():
             events.append(("stop", socket_path.exists()))
@@ -1057,7 +1075,7 @@ class RuntimeMonitorLifecycleTests(unittest.TestCase):
 
         self.assertEqual(events, [("schema", False), ("start", True), ("accept", True), ("stop", True)])
         self.assertFalse(socket_path.exists())
-        self.assertFalse(self.monitors[-1].is_alive(), "agent server left the monitor running")
+        self.assertFalse(self.spawned[-1].is_alive(), "agent server left the monitor running")
 
 
 if __name__ == "__main__":
