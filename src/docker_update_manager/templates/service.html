@@ -1,0 +1,432 @@
+{% extends "base.html" %}
+{% from "_ui.html" import icon, local_time, compose_changes, review_header, review_fact, review_confirmation, warning_notice %}
+{% set service = result.get('service', {}) %}
+{% set current_release = release_identity(service.get('version'), service.get('image')) %}
+{% set review_image = result.get('target_image') or service.get('image') %}
+{% set available_release = release_identity(result.get('remote_version'), review_image) %}
+{% set current_channel = display_channel(service.get('image'), result.get('tracking_tag')) if result.get('status') != 'UNTRACKED DIGEST' else none %}
+{% set digest_pinned = '@sha256:' in (service.get('image') or '') %}
+{% set channel_label = 'Tracking channel' if digest_pinned and result.get('tracking_tag') else ('Configured channel' if digest_pinned else 'Channel') %}
+{% set has_version_transition = result.get('status') in ['UPDATE', 'DIGEST CHANGED', 'PINNED UPDATE'] and current_release.value and available_release.value and current_release.value != available_release.value %}
+{% macro repository_label(image) -%}
+  {% set repository = display_repository(image) %}
+  {% if repository %}{% for segment in repository.split('/') %}{% if not loop.first %}/{% endif %}{{ segment }}{% if not loop.last %}<wbr>{% endif %}{% endfor %}{% else %}{{ image }}{% endif %}
+{%- endmacro %}
+{% block title %}{{ service.get('name') or service.get('key', 'Service') }}{% endblock %}
+{% block heading %}{{ service.get('name') or service.get('key', 'Service') }}{% endblock %}
+{% block page_breadcrumb %}
+  <nav class="page-breadcrumb" aria-label="Breadcrumb">
+    <ol class="breadcrumb">
+      <li class="breadcrumb-item"><a href="/services">Services</a></li>
+      <li class="breadcrumb-item active" aria-current="page">{{ service.get('name') or service.get('key', 'Service') }}</li>
+    </ol>
+  </nav>
+{% endblock %}
+{% block page_subtitle %}
+  <p class="page-meta service-header-context">
+    <span class="page-meta-item">{{ service.get('stack') or 'Standalone container' }}</span>
+    <span class="badge {{ result.get('status')|status_class }}">{{ result.get('status')|status_label }}</span>
+    {% if service.get('ignored') %}<span class="badge status-neutral">Excluded from updates</span>{% endif %}
+    {% if compose_status and compose_status.get('update_blocked') and result.get('status') in ['UPDATE', 'DIGEST CHANGED', 'PINNED UPDATE'] %}
+      <a class="service-execution-note" href="#configuration">{{ 'Blocked by pending configuration changes' if compose_status.get('status') == 'drifted' else 'Blocked by unverified configuration' }}</a>
+    {% endif %}
+  </p>
+{% endblock %}
+{% block content %}
+<div class="detail-grid">
+<div class="detail-main">
+  <section class="card service-summary" aria-labelledby="service-summary-title">
+    <div class="card-header service-summary-heading">
+      <div>
+        <h2 class="card-title" id="service-summary-title">Maintenance</h2>
+        <p class="card-subtitle">Image and update identity</p>
+      </div>
+    </div>
+    <div class="card-body maintenance-body">
+      <dl class="kv-grid maintenance-facts">
+        {% if current_release.value %}
+          <div class="maintenance-fact release-single is-primary">
+            <dt>{{ 'Configured tag' if current_release.source == 'tag' else 'Published version' }}</dt>
+            <dd><strong class="fact-emphasis">{{ current_release.value }}</strong></dd>
+          </div>
+        {% elif current_channel %}
+          <div class="maintenance-fact release-single is-primary">
+            <dt>{{ channel_label }}</dt>
+            <dd><strong class="fact-emphasis">{{ current_channel }}</strong></dd>
+          </div>
+        {% endif %}
+        <div class="maintenance-fact">
+          <dt>Update state</dt>
+          <dd><span class="badge {{ result.get('status')|status_class }}">{{ result.get('status')|status_label }}</span></dd>
+        </div>
+        {% if display_repository(service.get('image')) %}
+          <div class="maintenance-fact">
+            <dt>Image</dt>
+            <dd><code>{{ repository_label(service.get('image')) }}</code></dd>
+          </div>
+        {% endif %}
+        {% if service.get('digest') %}
+          <div class="maintenance-fact">
+            <dt>Current digest</dt>
+            <dd><code>{{ short_digest(service.get('digest')) or 'Not reported' }}</code></dd>
+          </div>
+        {% endif %}
+      </dl>
+      {% if not current_release.value and not current_channel and result.get('status') not in ['UNTRACKED DIGEST'] and not result.get('runtime_only') %}
+        <p class="fact-note">This image publishes no version label, so UPT identifies it by digest only.</p>
+      {% endif %}
+      {% set refresh_failed_here = runtime_record and runtime_record.get('state') == 'running' and not result.get('runtime_missing') and not service.get('ignored') and not service.get('local_build') and result.get('verification_failed_at') %}
+      {% if result.get('error') and not refresh_failed_here %}
+        <div class="alert alert-warning" role="status">{{ icon('alert') }}<div>
+          {% if result.get('status') == 'UNTRACKED DIGEST' %}<strong>Update tracking unavailable.</strong> {% else %}<strong>Registry result:</strong> {% endif %}{{ result.get('error') }}
+        </div></div>
+      {% endif %}
+      {% set can_refresh = runtime_record and runtime_record.get('state') == 'running' and not result.get('runtime_missing') and not service.get('ignored') and not service.get('local_build') %}
+      {% set refresh_state = 'failed' if result.get('verification_failed_at') else ('fresh' if result.get('verification_fresh') else 'stale') %}
+      {% macro refresh_hooks(state) -%}
+        data-service-refresh data-refresh-state="{{ state }}" data-service-key="{{ service.get('key') }}"
+        data-auto="{{ 'true' if state == 'stale' else 'false' }}"
+      {%- endmacro %}
+      {% macro refresh_status() -%}
+        <span class="refresh-status" data-refresh-status role="status" aria-live="polite" hidden></span>
+        <input type="hidden" data-refresh-csrf value="{{ csrf }}">
+      {%- endmacro %}
+      {% if result.get('checked_at') and can_refresh and refresh_state == 'fresh' %}
+        <p class="fact-note verification-line" {{ refresh_hooks('fresh') }}>
+          <span>Verified <time datetime="{{ result.get('checked_at') }}" data-local-time>{{ result.get('checked_at') }}</time></span><span class="verification-action" data-refresh-action><span aria-hidden="true">·</span><button class="btn-inline" type="button" data-refresh-button aria-label="Check update information again for this service">Check again</button></span>{{ refresh_status() }}
+        </p>
+      {% elif result.get('checked_at') %}
+        <p class="fact-note">{{ 'Verified' if result.get('verification_fresh') else 'Last checked' }} <time datetime="{{ result.get('checked_at') }}" data-local-time>{{ result.get('checked_at') }}</time>{% if not result.get('verification_fresh') %} · not current{% endif %}</p>
+      {% endif %}
+      {% if result.get('last_known_status') %}
+        <p class="fact-note">Last known update state: {{ result.get('last_known_status')|status_label }}{% if result.get('remote_version') %} · {{ result.get('remote_version') }}{% endif %}. Check this service before reviewing an update.</p>
+      {% endif %}
+      {% if can_refresh and refresh_state != 'fresh' %}
+        <div class="refresh-notice is-{{ 'danger' if refresh_state == 'failed' else 'warning' }}" {{ refresh_hooks(refresh_state) }}>
+          {{ icon('alert') }}
+          <p class="refresh-notice-text">{% if refresh_state == 'failed' %}<strong>Last check failed{% if result.get('error') %}: {{ result.get('error') }}{% endif %}.</strong> {% if result.get('checked_at') or result.get('last_known_status') %}Last-known information is kept but may be out of date.{% else %}No verified update information is available.{% endif %}{% else %}Update information needs checking.{% endif %}</p>
+          <span class="refresh-notice-action" data-refresh-action><button class="btn btn-sm btn-outline-primary" type="button" data-refresh-button>{{ 'Retry' if refresh_state == 'failed' else 'Check now' }}</button></span>
+          {{ refresh_status() }}
+        </div>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if compose_status %}
+    {% set cs = compose_status %}
+    {% set cs_state = cs.get('status') %}
+    {% set cs_badge = {'in_sync': ('status-success', 'In sync'), 'unsupported': ('status-warning', 'Inputs unverified'), 'drifted': ('status-warning', 'Changes pending'), 'unverifiable': ('status-danger', 'Not verified')}.get(cs_state, ('status-neutral', 'Unavailable')) %}
+    <section class="card compose-config is-{{ cs_state }}" id="configuration" aria-labelledby="configuration-title" data-compose-status="{{ cs_state }}">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title" id="configuration-title">Configuration</h2>
+          <p class="card-subtitle">Compose configuration compared with the running container</p>
+        </div>
+        <span class="badge {{ cs_badge[0] }}">{{ cs_badge[1] }}</span>
+      </div>
+      <div class="card-body compose-config-body">
+        {% if cs_state == 'in_sync' %}
+          <p class="compose-config-state">{{ icon('check') }}<span>Compose configuration in sync</span></p>
+          {% if cs.get('update_blocked') %}
+            {{ warning_notice('Image update blocked', cs.get('update_reasons', [{}])[0].get('message', 'The selected service execution context could not be verified.')) }}
+          {% endif %}
+          {% if cs.get('baseline') %}
+            <p class="fact-note">Trusted running configuration recorded {{ local_time(cs['baseline'].get('captured_at')) }}{% if cs['baseline'].get('origin') == 'adopted_backup' %} from a verified UPT backup{% endif %}.</p>
+          {% endif %}
+        {% elif cs_state == 'unsupported' %}
+          <p class="compose-config-state">{{ icon('info') }}<span>Selected service hash matches</span></p>
+          <p class="fact-note">UPT cannot verify all configuration inputs or keep a trusted record, because:</p>
+          <ul class="compose-reason-list">{% for reason in cs.get('reasons', []) %}<li>{{ reason.get('message') }}</li>{% endfor %}</ul>
+          {{ warning_notice('Image update blocked', 'All Compose configuration inputs must be verified before updating the image.') }}
+        {% elif cs_state == 'drifted' %}
+          {% set changes = cs.get('service_changes') or [] %}
+          {% set project_changes = cs.get('project_changes') or [] %}
+          {% if cs.get('changes_itemised') %}
+            {% if changes %}
+              <p class="compose-change-count">{{ changes|length }} service setting{{ '' if changes|length == 1 else 's' }} changed</p>
+              <dl class="compose-change-summary">
+                {% for entry in changes[:4] %}<div><dt>{{ entry.get('label') }}</dt><dd>{{ entry.get('summary') }}</dd></div>{% endfor %}
+              </dl>
+            {% endif %}
+            <details class="compose-review" data-compose-review>
+              <summary class="btn btn-sm btn-outline-primary">Show changes {{ icon('chevron-down', 'disclosure-chevron') }}</summary>
+              <div class="compose-review-body">
+                {% if changes %}
+                  <h4>This service</h4>
+                  {{ compose_changes(changes) }}
+                {% endif %}
+                {% if project_changes %}
+                  <h4>Elsewhere in the Compose project</h4>
+                  {{ compose_changes(project_changes) }}
+                {% endif %}
+                <p class="fact-note">Environment variables and labels are shown by name only. Commands, healthchecks and other fields that can contain secrets are reported only as changed.</p>
+              </div>
+            </details>
+          {% else %}
+            <p class="fact-note">UPT has no trusted record of this container's running configuration, so it cannot list the individual settings that changed.</p>
+          {% endif %}
+          {% if project_changes %}
+            <p class="compose-config-note">{{ icon('info') }}<span>Changes also affect other parts of the Compose project. They need a project-level reconciliation and cannot be applied as a single-service change.</span></p>
+          {% endif %}
+          {% if cs.get('image_change') %}
+            <p class="compose-config-note">{{ icon('info') }}<span>The Compose image reference also differs from the running image. Image changes are not applied as configuration changes.</span></p>
+          {% endif %}
+          {{ warning_notice('Image update blocked', 'Pending configuration changes must be resolved before updating the image.') }}
+          {% if cs.get('apply_eligible') and cs.get('baseline') and cs.get('scope') == 'service' %}
+            <div class="compose-apply-action">
+              <h3 class="card-title">Apply configuration</h3>
+              <div class="review-identity">
+                {{ review_fact('Action', 'Recreate this service') }}
+                {{ review_fact('Image', 'Unchanged · no pull') }}
+              </div>
+              <p class="confirmation-safety-copy">{{ icon('shield') }}<span>Trusted previous configuration available. UPT will attempt automatic recovery if startup or health verification fails.</span></p>
+              <form method="post" action="/compose/apply/review" data-compose-apply data-busy-form>
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <input type="hidden" name="service_key" value="{{ service.get('key') }}">
+                <input type="hidden" name="action" value="apply">
+                <button class="btn btn-primary" type="submit" data-busy-label="Preparing review…">Apply changes</button>
+              </form>
+            </div>
+          {% elif cs.get('bootstrap_eligible') %}
+            {# The establish-trust action below is the only available path. #}
+          {% else %}
+            {% if cs.get('apply_reasons') %}<ul class="compose-reason-list">{% for reason in cs.get('apply_reasons') %}<li>{{ reason.get('message') }}</li>{% endfor %}</ul>{% endif %}
+            <p class="fact-note">UPT compares the configuration again each time this page loads. Apply is unavailable until its running configuration and recovery evidence can be verified.</p>
+          {% endif %}
+          {% if cs.get('bootstrap_eligible') %}
+            <div class="compose-apply-action" data-compose-bootstrap-action>
+              <h3 class="card-title">Apply configuration and establish trust</h3>
+              <div class="review-identity">
+                {{ review_fact('Action', 'Recreate this service') }}
+                {{ review_fact('Image', 'Unchanged · no pull') }}
+              </div>
+              <p class="fact-note">UPT has no trusted previous configuration for this container, so automatic rollback is unavailable. It can recreate only this service from the reviewed Compose configuration and record the first trusted baseline after every verification passes.</p>
+              <form method="post" action="/compose/bootstrap/review" data-compose-bootstrap data-busy-form>
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <input type="hidden" name="service_key" value="{{ service.get('key') }}">
+                <input type="hidden" name="action" value="bootstrap">
+                <button class="btn btn-primary" type="submit" data-busy-label="Preparing review…">Apply configuration and establish trust</button>
+              </form>
+            </div>
+          {% elif cs.get('bootstrap_reasons') and not cs.get('baseline') %}
+            {% if cs.get('bootstrap_reasons')|selectattr('code', 'equalto', 'bootstrap_unresolved')|list %}
+              <div class="alert alert-danger alert-compact" role="alert" data-compose-bootstrap-fence>{{ icon('alert') }}<div><strong>Bootstrap failed/interrupted — manual recovery required</strong><p>UPT could not prove that establishing trust completed. It will not create a trusted baseline, apply or discard configuration, or update this service's image until manual recovery is resolved. Private operation evidence is retained.</p></div></div>
+            {% else %}
+              <p class="fact-note">Establishing trust is unavailable:</p>
+              <ul class="compose-reason-list">{% for reason in cs.get('bootstrap_reasons') %}<li>{{ reason.get('message') }}</li>{% endfor %}</ul>
+            {% endif %}
+          {% endif %}
+          {% if cs.get('discard_eligible') and cs.get('baseline') and cs.get('scope') == 'service' %}
+            <div class="compose-apply-action">
+              <h3 class="card-title">Discard changes</h3>
+              <p class="fact-note">Restore the reviewed source values to the trusted running configuration. The service will not be recreated or restarted, and its image stays unchanged.</p>
+              <form method="post" action="/compose/discard/review" data-compose-discard data-busy-form>
+                <input type="hidden" name="csrf" value="{{ csrf }}">
+                <input type="hidden" name="service_key" value="{{ service.get('key') }}">
+                <input type="hidden" name="action" value="discard">
+                <button class="btn btn-outline-secondary" type="submit" data-busy-label="Preparing review…">Discard changes</button>
+              </form>
+            </div>
+          {% endif %}
+        {% elif cs_state == 'unverifiable' %}
+          <h3 class="compose-config-heading">{{ icon('alert') }}<span>Configuration could not be verified</span></h3>
+          <ul class="compose-reason-list">{% for reason in cs.get('reasons', []) %}<li>{{ reason.get('message') }}</li>{% endfor %}</ul>
+          {{ warning_notice('Image update blocked', 'The Compose configuration must be verified before updating the image.') }}
+        {% else %}
+          <p class="compose-config-state is-muted">{{ icon('info') }}<span>Configuration status is temporarily unavailable.</span></p>
+        {% endif %}
+      </div>
+    </section>
+  {% endif %}
+
+  {% if result.get('runtime_reconciled') and not result.get('verification_failed_at') %}
+    <div class="alert alert-warning runtime-only-note" role="status">{{ icon('alert') }}<div>This container changed since the last inventory scan, so its update information must be checked before an update can be reviewed.</div></div>
+  {% elif result.get('runtime_missing') %}
+    <div class="alert alert-warning runtime-only-note" role="status">{{ icon('alert') }}<div>This container is absent from the current runtime. Select its current replacement to check update information or review rollback.</div></div>
+  {% elif result.get('runtime_only') %}
+    <div class="alert alert-info runtime-only-note" role="status">{{ icon('info') }}<div>This container has not been checked for updates yet.</div></div>
+  {% endif %}
+  {% if can_update %}
+    <section class="card update-confirmation" id="update-confirmation" aria-labelledby="update-confirmation-title">
+      {{ review_header('Review update', 'Confirm the release or exact image change before UPT updates this service.', 'update-confirmation-title', None) }}
+      <div class="card-body">
+        {% if has_version_transition %}
+          <div class="release-transition review-transition" aria-label="Reviewed version change">
+            <div class="release-endpoint"><span>Current {{ 'tag' if current_release.source == 'tag' else 'version' }}</span><strong>{{ current_release.value }}</strong></div>
+            <span class="release-arrow" aria-hidden="true">→</span>
+            <div class="release-endpoint release-endpoint-target"><span>Target {{ 'tag' if available_release.source == 'tag' else 'version' }}</span><strong>{{ available_release.value }}</strong></div>
+          </div>
+        {% else %}
+          <div class="review-identity">
+            {% if current_channel %}
+              {{ review_fact(channel_label, current_channel) }}
+            {% elif current_release.value %}
+              {{ review_fact('Current tag' if current_release.source == 'tag' else 'Current version', current_release.value) }}
+            {% endif %}
+            {% if available_release.value and not (current_release.value and current_release.value == available_release.value) %}
+              <p class="review-target-release"><span>{{ 'Target tag' if available_release.source == 'tag' else 'Target version' }}</span><strong>{{ available_release.value }}</strong></p>
+            {% endif %}
+          </div>
+        {% endif %}
+
+        <div class="review-image-identity">
+          <span>Image</span>
+          <code>{{ repository_label(service.get('image')) }}</code>
+        </div>
+        {% if service.get('digest') and result.get('remote_digest') %}
+          <div class="digest-transition review-digest-transition" aria-label="Reviewed current and target digests">
+            <span class="digest-endpoint"><span>Current digest</span><code>{{ short_digest(service.get('digest')) or 'Not reported' }}</code></span>
+            <span class="release-arrow" aria-hidden="true">→</span>
+            <span class="digest-endpoint digest-endpoint-target"><span>Target digest</span><code>{{ short_digest(result.get('remote_digest')) or 'Not reported' }}</code></span>
+          </div>
+        {% elif result.get('remote_digest') %}
+          <p class="review-target-release"><span>Target digest</span><strong><code>{{ short_digest(result.get('remote_digest')) or 'Not reported' }}</code></strong></p>
+        {% endif %}
+
+        <details class="identity-disclosure">
+          <summary>Show exact image references and digests</summary>
+          <dl class="exact-identity-facts">
+            <div><dt>Current image reference</dt><dd><code class="technical-value">{{ service.get('image') }}</code></dd></div>
+            <div><dt>Target image reference</dt><dd><code class="technical-value">{{ result.get('target_image') or exact_digest_reference(service.get('image'), result.get('remote_digest')) or service.get('image') }}</code></dd></div>
+            <div><dt>Current digest</dt><dd><code class="technical-value">{{ service.get('digest') or 'Not reported' }}</code></dd></div>
+            <div><dt>Target digest</dt><dd><code class="technical-value">{{ result.get('remote_digest') or 'Not reported' }}</code></dd></div>
+          </dl>
+        </details>
+
+        <form class="update-confirmation-form" method="post" action="/operations/update" data-busy-form>
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="confirmation_id" value="{{ confirmation_id }}">
+          {{ review_confirmation('confirm_update', 'I confirm updating this service to the reviewed target image.', 'Update service', 'Starting update…', 'UPT backs up the Compose source, pulls and verifies the reviewed digest, and then recreates only this service without dependencies. Volumes are preserved.', false) }}
+        </form>
+      </div>
+    </section>
+  {% elif result.get('status') in ['UPDATE', 'DIGEST CHANGED', 'PINNED UPDATE'] and not (compose_status and compose_status.get('update_blocked')) %}
+    <p class="service-readonly-note" role="status">{{ update_unavailable_reason or 'Web update is unavailable because this is not a verified running Compose service. Use the CLI after reviewing the service configuration.' }}</p>
+  {% endif %}
+
+  {% if can_review_rollback %}
+    {% set rollback_current = release_identity(rollback_target.get('current_version'), rollback_target.get('current_image')) %}
+    {% set rollback_release = release_identity(rollback_target.get('target_version'), rollback_target.get('target_image')) %}
+    {% set rollback_channel = display_channel(rollback_target.get('current_image'), rollback_target.get('tracking_tag')) %}
+    {% set rollback_version_transition = rollback_current.value and rollback_release.value and rollback_current.value != rollback_release.value %}
+    <section class="card update-confirmation rollback-confirmation" id="rollback-confirmation" aria-labelledby="rollback-confirmation-title">
+      {{ review_header('Review rollback', 'Restore the image and Compose configuration from this protected point.', 'rollback-confirmation-title', 'rollback') }}
+      <div class="card-body">
+        {% if rollback_version_transition %}
+          <div class="release-transition review-transition" aria-label="Reviewed rollback version change">
+            <div class="release-endpoint"><span>Current {{ 'tag' if rollback_current.source == 'tag' else 'version' }}</span><strong>{{ rollback_current.value }}</strong></div>
+            <span class="release-arrow" aria-hidden="true">→</span>
+            <div class="release-endpoint release-endpoint-target"><span>Restore {{ 'tag' if rollback_release.source == 'tag' else 'version' }}</span><strong>{{ rollback_release.value }}</strong></div>
+          </div>
+        {% else %}
+          <div class="review-identity">
+            {% if rollback_channel %}{{ review_fact('Current channel', rollback_channel) }}{% endif %}
+            {% if rollback_current.value %}<p class="review-target-release"><span>{{ 'Current tag' if rollback_current.source == 'tag' else 'Current version' }}</span><strong>{{ rollback_current.value }}</strong></p>{% endif %}
+            {% if rollback_release.value %}<p class="review-target-release"><span>{{ 'Restore tag' if rollback_release.source == 'tag' else 'Restore version' }}</span><strong>{{ rollback_release.value }}</strong></p>{% endif %}
+          </div>
+        {% endif %}
+
+        <div class="review-image-identity">
+          <span>{{ 'Pinned image' if rollback_target.get('digest_pin') else 'Image' }}</span>
+          <code>{{ repository_label(rollback_target.get('current_image')) }}</code>
+        </div>
+        {% if rollback_target.get('current_digest') and rollback_target.get('target_digest') %}
+          <div class="digest-transition review-digest-transition" aria-label="Current digest to protected rollback digest">
+            <span class="digest-endpoint"><span>Current digest</span><code>{{ short_digest(rollback_target.get('current_digest')) or 'Not reported' }}</code></span>
+            <span class="release-arrow" aria-hidden="true">→</span>
+            <span class="digest-endpoint digest-endpoint-target"><span>Restore digest</span><code>{{ short_digest(rollback_target.get('target_digest')) or 'Not reported' }}</code></span>
+          </div>
+        {% endif %}
+        <p class="rollback-recorded-time">Update recorded {{ local_time(rollback_target.get('history_timestamp')) }}</p>
+
+        <details class="identity-disclosure">
+          <summary>Show exact image references and digests</summary>
+          <dl class="exact-identity-facts">
+            <div><dt>Current image reference</dt><dd><code class="technical-value">{{ rollback_target.get('current_image') }}</code></dd></div>
+            <div><dt>Protected rollback image</dt><dd><code class="technical-value">{{ rollback_target.get('target_image') }}</code></dd></div>
+            <div><dt>Current digest</dt><dd><code class="technical-value">{{ rollback_target.get('current_digest') or 'Not reported' }}</code></dd></div>
+            <div><dt>Protected rollback digest</dt><dd><code class="technical-value">{{ rollback_target.get('target_digest') or 'Not reported' }}</code></dd></div>
+          </dl>
+        </details>
+
+        <form class="update-confirmation-form" method="post" action="/operations/rollback" data-busy-form>
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="confirmation_id" value="{{ rollback_confirmation_id }}">
+          {{ review_confirmation('confirm_rollback', 'I confirm restoring the reviewed rollback image for this service.', 'Rollback service', 'Starting rollback…', 'UPT will restore the Compose configuration saved before this update and recreate only this service. Volumes and application data stay in place; application data migrations are not reversed.', true) }}
+        </form>
+      </div>
+    </section>
+  {% endif %}
+
+</div>
+<aside class="detail-aside" aria-label="Runtime and technical details">
+  <section class="card runtime-detail" aria-labelledby="runtime-detail-title">
+    <div class="card-header">
+      <div>
+        <h2 class="card-title" id="runtime-detail-title">Runtime</h2>
+        {% if runtime_record %}
+          <p class="card-subtitle">
+            {% if result.get('runtime_stale') %}Last-known Docker state · {% else %}Docker state checked · {% endif %}
+            {% if runtime.get('last_success_at') %}<time data-local-time datetime="{{ runtime.get('last_success_at')|utc_timestamp }}" title="{{ runtime.get('last_success_at')|utc_timestamp }}">{{ runtime.get('last_success_at')|relative_time }}</time>{% else %}time unavailable{% endif %}
+          </p>
+        {% endif %}
+      </div>
+    </div>
+    {% if runtime_record %}
+      {% if result.get('runtime_stale') %}<div class="runtime-last-known-note">{{ icon('alert') }}This is the last-known container state. Docker could not confirm its current state.</div>{% endif %}
+      <div class="card-body">
+        <dl class="kv-list runtime-facts">
+          <div class="runtime-fact"><dt>Container state</dt><dd><span class="runtime-state"><span class="status-dot is-{{ 'success' if runtime_record.get('state') == 'running' else ('danger' if runtime_record.get('state') in ['exited', 'dead'] else 'warning') }}" aria-hidden="true"></span><strong>{{ runtime_record.get('state', 'unknown')|title }}</strong></span></dd></div>
+          <div class="runtime-fact"><dt>Docker healthcheck</dt><dd>{% if runtime_record.get('healthcheck') == 'none' %}No healthcheck{% else %}{{ runtime_record.get('healthcheck', 'unknown')|title }}{% endif %}</dd></div>
+          <div class="runtime-fact"><dt>Started at</dt><dd>{% if runtime_record.get('started_at') %}<time data-local-time datetime="{{ runtime_record.get('started_at')|utc_timestamp }}" title="{{ runtime_record.get('started_at')|utc_timestamp }}">{{ runtime_record.get('started_at')|relative_time }}</time>{% else %}Not recorded{% endif %}</dd></div>
+          <div class="runtime-fact"><dt>Restart count</dt><dd>{{ runtime_record.get('restart_count') if runtime_record.get('restart_count') is not none else 'Unknown' }}</dd></div>
+          <div class="runtime-fact"><dt>Restart policy</dt><dd>{{ runtime_record.get('restart_policy') or 'Unknown' }}</dd></div>
+          {% if runtime_record.get('state') != 'running' %}
+            <div class="runtime-fact"><dt>Exit code</dt><dd>{{ runtime_record.get('exit_code') if runtime_record.get('exit_code') is not none else 'Unknown' }}</dd></div>
+            <div class="runtime-fact"><dt>Finished at</dt><dd>{% if runtime_record.get('finished_at') %}<time data-local-time datetime="{{ runtime_record.get('finished_at')|utc_timestamp }}" title="{{ runtime_record.get('finished_at')|utc_timestamp }}">{{ runtime_record.get('finished_at')|relative_time }}</time>{% else %}Not recorded{% endif %}</dd></div>
+            <div class="runtime-fact"><dt>OOM-killed</dt><dd>{% if runtime_record.get('oom_killed') %}<span class="badge status-danger">Yes</span>{% else %}No{% endif %}</dd></div>
+          {% endif %}
+          {% if runtime_record.get('healthcheck') not in ['none', 'unknown'] %}
+            <div class="runtime-fact"><dt>Health failing streak</dt><dd>{{ runtime_record.get('health_failing_streak') if runtime_record.get('health_failing_streak') is not none else 'Unknown' }}</dd></div>
+            <div class="runtime-fact"><dt>Last healthcheck</dt><dd>{% set health_time = runtime_record.get('health_last_finished_at') or runtime_record.get('health_last_started_at') %}{% if health_time %}<time data-local-time datetime="{{ health_time|utc_timestamp }}" title="{{ health_time|utc_timestamp }}">{{ health_time|relative_time }}</time>{% else %}Not recorded{% endif %}</dd></div>
+            <div class="runtime-fact"><dt>Last healthcheck exit code</dt><dd>{{ runtime_record.get('health_last_exit_code') if runtime_record.get('health_last_exit_code') is not none else 'Not recorded' }}</dd></div>
+          {% endif %}
+        </dl>
+        {% if runtime_record.get('oom_killed') %}<div class="alert alert-danger runtime-oom" role="status">{{ icon('alert') }}<div><strong>Docker reports this container was OOM-killed.</strong> Exit code and finish time are shown above.</div></div>{% endif %}
+        {% if service.get('ignored') %}<p class="fact-note">This service is excluded from update maintenance and remains visible to runtime monitoring.</p>{% endif %}
+      </div>
+    {% elif runtime.get('status') == 'unavailable' %}
+      <div class="card-body"><p class="mb-0">Runtime state is unavailable{% if runtime.get('last_success_at') %}; no last-known entry exists for this container.{% else %} because no successful runtime snapshot exists yet.{% endif %}</p></div>
+    {% elif result.get('runtime_missing') %}
+      <div class="card-body"><p class="mb-0 runtime-missing-message">This scan-known container is not present in the current Docker runtime. Refresh the update scan to establish a new service identity.</p></div>
+    {% elif runtime.get('status') == 'stale' %}
+      <div class="card-body"><p class="mb-0">The stale runtime snapshot cannot confirm whether this container is currently present.</p></div>
+    {% else %}
+      <div class="card-body"><p class="mb-0">No runtime record is available for this container yet.</p></div>
+    {% endif %}
+  </section>
+
+  <details class="card technical-details">
+    <summary class="technical-summary">
+      <span><strong>Technical details</strong><span class="card-subtitle">Image IDs, digests and Compose source paths</span></span>
+      {{ icon('chevron-down', 'disclosure-chevron') }}
+    </summary>
+    <div class="technical-details-body">
+      <dl class="kv-list is-stacked technical-facts">
+        <dt>Running image ID</dt><dd><code class="technical-value">{{ service.get('image_id') or 'Not reported' }}</code></dd>
+        <dt>Running digest</dt><dd><code class="technical-value">{{ service.get('digest') or 'Not reported' }}</code></dd>
+        <dt>Remote digest</dt><dd><code class="technical-value">{{ result.get('remote_digest') or 'Not reported' }}</code></dd>
+        <dt>Architecture</dt><dd>{{ service.get('architecture') or 'Not reported' }}</dd>
+        <dt>Compose files</dt>
+        <dd>
+          {% if service.get('compose_files') %}
+            <ul class="technical-paths">{% for path in service.get('compose_files', []) %}<li><code class="technical-value">{{ path }}</code></li>{% endfor %}</ul>
+          {% elif result.get('runtime_only') %}Not available in the registry scan{% else %}Standalone container{% endif %}
+        </dd>
+        <dt>Working directory</dt><dd><code class="technical-value">{{ service.get('working_dir') or 'Not reported' }}</code></dd>
+      </dl>
+    </div>
+  </details>
+</aside>
+</div>
+{% endblock %}

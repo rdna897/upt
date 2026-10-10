@@ -1,0 +1,21 @@
+[Unit]
+Description=UPT bounded Docker update agent
+After=docker.service
+Requires=docker.service
+
+[Service]
+Environment=UPT_WEB_CONFIG=/etc/docker-update-manager/web.yml
+Type=simple
+ExecStart=/usr/local/bin/upt-agent
+RuntimeDirectory=docker-update-manager
+RuntimeDirectoryMode=0750
+User=root
+Group=docker-update-manager-web
+UMask=007
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

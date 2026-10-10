@@ -1,0 +1,4 @@
+# Optional drop-in snippet; this file is NOT installed or enabled automatically.
+# Use only after reviewing the exact project directory UPT may replace files in.
+[Service]
+ReadWritePaths=/root/compose-example

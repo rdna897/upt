@@ -1,0 +1,170 @@
+{#- Shared presentation macros. Presentation only: no data decisions here. -#}
+{% macro icon(name, cls='') -%}
+<svg class="icon{% if cls %} {{ cls }}{% endif %}" aria-hidden="true" focusable="false"><use href="#i-{{ name }}"></use></svg>
+{%- endmacro %}
+
+{% macro local_time(value) -%}
+{% if value %}<time data-local-time datetime="{{ value|utc_timestamp }}" title="{{ value|utc_timestamp }}">{{ value|relative_time }}</time>{% else %}Unknown{% endif %}
+{%- endmacro %}
+
+{#- Runtime state as dot + words so meaning never depends on colour alone. -#}
+{% macro runtime_state(record, stale=False, missing=False) -%}
+{% if missing %}
+  <span class="runtime-state"><span class="status-dot is-danger" aria-hidden="true"></span><strong class="runtime-missing-label">Not present in current Docker runtime</strong></span>
+{% elif record %}
+  {% set state = record.get('state', 'unknown') %}
+  {% set health = record.get('healthcheck', 'unknown') %}
+  {% if record.get('oom_killed') or state in ['dead', 'exited'] or health == 'unhealthy' %}{% set tone = 'danger' %}
+  {% elif state in ['restarting', 'paused', 'created'] or health == 'starting' %}{% set tone = 'warning' %}
+  {% elif state == 'running' %}{% set tone = 'success' %}
+  {% else %}{% set tone = 'neutral' %}{% endif %}
+  <span class="runtime-state{% if stale %} is-stale{% endif %}">
+    <span class="status-dot is-{{ tone }}" aria-hidden="true"></span>
+    <span><strong>{{ state|title }}</strong>{% if health == 'none' %}<span class="runtime-state-sub"> · No healthcheck</span>{% elif health not in ['unknown', None] %}<span class="runtime-state-sub"> · {{ health|title }}</span>{% endif %}{% if record.get('oom_killed') %}<span class="runtime-state-sub"> · OOM-killed</span>{% endif %}{% if record.get('restart_count') %}<span class="runtime-state-sub"> · {{ record.get('restart_count') }} restarts</span>{% endif %}{% if stale %}<span class="runtime-state-sub"> · last known</span>{% endif %}</span>
+  </span>
+{% else %}
+  <span class="runtime-state is-empty"><span class="status-dot is-neutral" aria-hidden="true"></span><span>No runtime data</span></span>
+{% endif %}
+{%- endmacro %}
+
+{#- Version cell: structured facts from update_identity(); never a guessed value. -#}
+{% macro version_value(fact) -%}
+{% if fact and fact.value %}<span class="version-value is-{{ fact.kind }}" title="{{ fact.label }}">{% if fact.kind == 'digest' %}<code>{{ fact.value }}</code>{% else %}{{ fact.value }}{% endif %}<span class="version-kind">{{ fact.label }}</span></span>{% elif fact %}<span class="version-value is-missing">{{ fact.label }}</span>{% endif %}
+{%- endmacro %}
+
+{% macro sprite() -%}
+<svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="8" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="5" rx="1.5"/><rect x="13.5" y="11.5" width="7" height="9" rx="1.5"/><rect x="3.5" y="14.5" width="7" height="6" rx="1.5"/></symbol>
+    <symbol id="i-updates" viewBox="0 0 24 24"><path d="M12 20V8"/><path d="m7 12 5-5 5 5"/><path d="M5 4h14"/></symbol>
+    <symbol id="i-services" viewBox="0 0 24 24"><path d="m12 3 8 4.5-8 4.5-8-4.5z"/><path d="m4 12 8 4.5 8-4.5"/><path d="m4 16.5 8 4.5 8-4.5"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M3.5 12a8.5 8.5 0 1 0 2.5-6"/><path d="M3 4v4h4"/><path d="M12 7.5V12l3 2"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+    <symbol id="i-signout" viewBox="0 0 24 24"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"/><path d="M10 16l-4-4 4-4"/><path d="M6 12h10"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8"/><path d="M4 4v4h4"/><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16"/><path d="M20 20v-4h-4"/></symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M7 7l10 10M17 7 7 17"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4"/><path d="M12 17h.01"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5"/><path d="M12 8h.01"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.4 3 8.3 7 10 4-1.7 7-5.6 7-10V6z"/><path d="m9 12 2 2 4-4"/></symbol>
+    <symbol id="i-rollback" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></symbol>
+  </defs>
+</svg>
+{%- endmacro %}
+
+{#- Page-header freshness line shared by Overview, Updates and Services. -#}
+{% macro freshness_meta(runtime, snapshot, scan, snapshot_trustworthy, show_runtime=True) -%}
+{% if show_runtime %}
+<span class="page-meta-item freshness" data-runtime-freshness>
+  {% if runtime.get('status') == 'current' and runtime.get('captured_at') %}
+    Runtime checked {{ local_time(runtime.get('captured_at')) }}
+  {% elif runtime.get('status') == 'unavailable' and runtime.get('last_success_at') %}
+    {{ runtime|runtime_failure_message }} · last check {{ local_time(runtime.get('last_success_at')) }}
+  {% elif runtime.get('status') == 'stale' and runtime.get('last_success_at') %}
+    Runtime stale · last check {{ local_time(runtime.get('last_success_at')) }}
+  {% elif runtime.get('status') == 'unavailable' %}
+    {{ runtime|runtime_failure_message }} · no successful check yet
+  {% elif runtime.get('_error') %}
+    Runtime snapshot unavailable
+  {% else %}
+    No successful runtime check yet
+  {% endif %}
+</span>
+{% endif %}
+<span class="page-meta-item scan-freshness" data-update-freshness>
+  {% if snapshot_trustworthy %}
+    Inventory scanned {{ local_time(snapshot.get('finished_at')) }}
+  {% else %}
+    No complete inventory scan yet
+  {% endif %}
+</span>
+{% if scan and scan.get('finished_at') and scan.get('status') not in ['complete', 'running', 'finalizing'] %}
+<span class="page-meta-item scan-attempt-time">Latest attempt {{ scan.get('status', 'unknown')|lower }} {{ local_time(scan.get('finished_at')) }}</span>
+{% endif %}
+{%- endmacro %}
+
+{#- Scan trigger + live progress. One instance per page (app.js binds by data hook). -#}
+{% macro scan_button(scan, csrf) -%}
+{% set scan_active = scan and scan.get('status') in ['running', 'finalizing'] %}
+<form method="post" action="/scan" data-scan-form class="scan-action">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <button class="btn btn-primary" type="submit" {% if scan_active %}disabled{% endif %}>{{ icon('refresh') }}<span data-scan-label>{% if scan_active %}Scan in progress{% else %}Scan now{% endif %}</span></button>
+  <span data-scan-status class="scan-action-status" role="status" aria-live="polite"></span>
+</form>
+{%- endmacro %}
+
+{% macro scan_progress(scan) -%}
+{% set scan_active = scan and scan.get('status') in ['running', 'finalizing'] %}
+{% set scan_events = scan.get('events', []) if scan_active and not scan.get('_error') else [] %}
+{% set progress = scan_progress_projection(scan_events) %}
+<section class="card scan-progress" data-scan-progress
+         data-run-id="{{ scan.get('id', '') if scan_active else '' }}"
+         data-status="{{ scan.get('status', 'idle') if scan_active else 'idle' }}"
+         data-completed="{{ scan.get('completed', 0) if scan_active else 0 }}"
+         data-total="{{ scan.get('total', 0) if scan_active else 0 }}"
+         data-cursor="{{ progress.cursor if scan_active else 0 }}"
+         data-scan-rows='{{ progress.rows|tojson }}'
+         {% if not scan_active %}hidden{% endif %}
+         aria-labelledby="scan-progress-title">
+  <div class="scan-progress-heading">
+    <span class="spinner" aria-hidden="true"></span>
+    <div class="scan-progress-text">
+      <h2 class="card-title" id="scan-progress-title">Read-only scan in progress</h2>
+      <p class="scan-progress-stage" data-scan-stage>{% if scan_active and progress.stage %}{{ progress.stage }}{% elif scan_active %}Reconnecting to the active scan…{% else %}Preparing read-only scan…{% endif %}</p>
+    </div>
+    <span class="badge status-neutral scan-progress-count" data-scan-count>{{ scan.get('completed', 0) if scan_active else 0 }} / {{ scan.get('total', 0) or 'discovering' if scan_active else 'services' }}</span>
+  </div>
+  <progress class="meter scan-progress-bar" data-scan-bar
+            value="{{ scan.get('completed', 0) if scan_active else 0 }}"
+            max="{{ scan.get('total', 1) if scan_active else 1 }}"
+            {% if not scan_active or not scan.get('total') %}hidden{% endif %}
+            aria-label="Services checked"></progress>
+  <ul class="scan-events" data-scan-events aria-live="polite" aria-label="Service progress">{% for row in progress.visible %}<li class="scan-service-row" data-row-key="{{ row.key }}" data-state="{{ row.state }}"{% if row.detail %} title="{{ row.detail }}"{% endif %}><span class="scan-service-name">{{ row.name }}</span><span class="scan-service-state">{{ row.label }}</span></li>{% endfor %}</ul>
+  <p class="scan-progress-connection" data-scan-connection role="status">Scan continues on the server if this page closes.</p>
+</section>
+{%- endmacro %}
+
+{# Concrete privileged-review primitives shared by Update, Rollback and Apply. #}
+{% macro review_header(title, subtitle, heading_id, icon_name=None) -%}
+<div class="card-header"><div><h2 class="card-title" id="{{ heading_id }}">{% if icon_name %}{{ icon(icon_name) }}{% endif %}{{ title }}</h2><p class="card-subtitle">{{ subtitle }}</p></div></div>
+{%- endmacro %}
+
+{% macro review_fact(label, value) -%}
+<p class="review-channel"><span>{{ label }}</span><strong>{{ value }}</strong></p>
+{%- endmacro %}
+
+{% macro review_confirmation(name, text, action, busy, safety, danger=False, checkbox_id=None, cancel_href=None) -%}
+<p class="confirmation-safety-copy">{{ icon('shield') }}<span>{{ safety }}</span></p>
+<label class="form-check update-confirmation-check">
+  <input class="form-check-input" type="checkbox"{% if checkbox_id %} id="{{ checkbox_id }}"{% endif %} name="{{ name }}" value="yes" required>
+  <span class="form-check-label">{{ text }}</span>
+</label>
+{% if cancel_href %}<div class="review-actions">{% endif -%}
+<button class="btn {{ 'btn-danger' if danger else 'btn-primary' }}" type="submit" data-busy-label="{{ busy }}">{{ action }}</button>
+{%- if cancel_href %}<a class="btn btn-outline-secondary" href="{{ cancel_href }}">Cancel</a></div>{% endif %}
+{%- endmacro %}
+
+{% macro warning_notice(title, text) -%}
+<div class="alert alert-warning alert-compact" role="status">{{ icon('alert') }}<div><strong>{{ title }}</strong><p>{{ text }}</p></div></div>
+{%- endmacro %}
+
+{% macro compose_changes(entries) -%}
+<ul class="compose-change-list">
+{% for entry in entries %}
+  <li class="compose-change">
+    <div class="compose-change-head"><strong>{{ entry.get('label') }}</strong><span>{{ entry.get('summary') }}</span></div>
+    {% for key, word in [('added', 'Added'), ('removed', 'Removed'), ('changed', 'Changed')] %}
+      {% if entry.get(key) %}<p class="compose-change-names"><span>{{ word }}</span>{% for name in entry.get(key) %}<code>{{ name }}</code>{% endfor %}</p>{% endif %}
+    {% endfor %}
+    {% if entry.get('hidden') %}<p class="compose-change-hidden">{{ entry.get('hidden') }} further item{{ '' if entry.get('hidden') == 1 else 's' }} not shown</p>{% endif %}
+  </li>
+{% endfor %}
+</ul>
+{%- endmacro %}

@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% from "_ui.html" import review_header, review_fact, review_confirmation %}
+{% block title %}{{ review.get('service') }} trust bootstrap{% endblock %}
+{% block heading %}{{ review.get('service') }} configuration{% endblock %}
+{% block page_breadcrumb %}
+  <nav class="page-breadcrumb" aria-label="Breadcrumb">
+    <ol class="breadcrumb">
+      <li class="breadcrumb-item"><a href="/services">Services</a></li>
+      <li class="breadcrumb-item"><a href="/services/{{ service_key|urlencode }}">{{ review.get('service') }}</a></li>
+      <li class="breadcrumb-item active" aria-current="page">Establish trust</li>
+    </ol>
+  </nav>
+{% endblock %}
+{% block page_subtitle %}<p class="page-meta">Apply configuration and establish trust · {{ review.get('stack') }}</p>{% endblock %}
+{% block content_class %} content-narrow{% endblock %}
+{% block content %}
+<section class="card update-confirmation" aria-labelledby="bootstrap-title">
+  {{ review_header('Apply configuration without automatic rollback?', 'UPT has no trusted record of the configuration this container is running.', 'bootstrap-title') }}
+  <div class="card-body">
+    <div class="review-identity">
+      {{ review_fact('Action', 'Recreate this service') }}
+      {{ review_fact('Image', 'Unchanged · no pull') }}
+      {{ review_fact('Previous configuration', 'Unknown · no trusted baseline') }}
+      {{ review_fact('Automatic rollback', 'Unavailable') }}
+    </div>
+    <p class="confirmation-safety-copy">UPT will recreate this service using the reviewed Compose configuration. Its image will not be pulled or changed. UPT has no trusted previous configuration baseline to restore automatically. If recreation or verification fails, manual recovery may be required. The first trusted baseline will be created only after the new service passes all verification checks. Persistent application data is preserved, but application changes to that data cannot be rolled back by UPT.</p>
+    <div>
+      <h3 class="card-title compose-changes-title">Reviewed configuration</h3>
+      <p class="fact-note">Previous values are unknown, so this is the desired configuration rather than a list of changes.</p>
+      <ul class="compose-change-list">
+        {% for entry in review.get('proposal', []) %}
+        <li class="compose-change">
+          <div class="compose-change-head"><strong>{{ entry.get('label') }}</strong><span>{{ entry.get('summary') }}</span></div>
+          {% if entry.get('items') %}<p class="compose-change-names"><span>Desired</span>{% for name in entry.get('items') %}<code>{{ name }}</code>{% endfor %}</p>{% endif %}
+          {% if entry.get('hidden') %}<p class="compose-change-hidden">{{ entry.get('hidden') }} further item{{ '' if entry.get('hidden') == 1 else 's' }} not shown</p>{% endif %}
+          <p class="compose-change-hidden">Previous value: unknown</p>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% if review.get('observations') %}
+    <div>
+      <h3 class="card-title compose-changes-title">Running container (observed)</h3>
+      <div class="review-identity">
+        {% for fact in review.get('observations') %}{{ review_fact(fact.get('label'), fact.get('value')) }}{% endfor %}
+      </div>
+      <p class="fact-note">Observations come from Docker. They do not reconstruct the previous Compose configuration.</p>
+    </div>
+    {% endif %}
+    <p class="fact-note">Environment variables and labels are shown by name only. Commands, healthchecks and other fields that can contain secrets are reported only as configured.</p>
+    <form class="update-confirmation-form" method="post" action="/operations/compose-bootstrap" data-busy-form>
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="confirmation_id" value="{{ confirmation_id }}">
+      {{ review_confirmation('acknowledge_no_rollback', 'I understand that automatic configuration rollback is unavailable and manual recovery may be required.', 'Recreate service and establish trust', 'Starting trust bootstrap…', 'UPT recreates only this service without pulling, building or recreating dependencies. No trusted baseline is created unless every source, image, project, peer and health check passes.', checkbox_id='confirm-bootstrap', cancel_href='/services/' ~ (service_key|urlencode)) }}
+    </form>
+  </div>
+</section>
+{% endblock %}

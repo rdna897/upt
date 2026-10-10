@@ -1,0 +1,15 @@
+web:
+  listen: 127.0.0.1
+  port: 8787
+  socket: /run/docker-update-manager/agent.sock
+  state_dir: /var/lib/docker-update-manager-web
+  trusted_proxies: []
+  allowed_hosts: [localhost, 127.0.0.1, "[::1]"]
+  allow_insecure_http: false
+  state_owner: docker-update-manager-web
+  session_idle_minutes: 43200
+  session_absolute_hours: 720
+  bootstrap_minutes: 15
+  scan_retention_days: 30
+  verification_freshness_hours: 6
+  audit_retention_days: 365

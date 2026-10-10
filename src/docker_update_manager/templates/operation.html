@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% from "_ui.html" import icon %}
+{% set terminal = operation.get('status') in ['succeeded', 'failed', 'blocked'] %}
+{% set is_rollback = operation.get('kind') == 'rollback' %}
+{% set is_compose = operation.get('kind') in ['compose_reconcile', 'compose_bootstrap'] %}
+{% set operation_name = 'configuration' if is_compose else 'rollback' if is_rollback else 'update' %}
+{% set view = operation_presentation(operation) %}
+{% set timeline = operation.get('events', [])|operation_timeline(terminal) %}
+{% set active_event = timeline|selectattr('_timeline_active')|list|last %}
+{% set operation_result = operation.get('result') or {} %}
+{% set current_service_key = operation_result.get('current_service_key') or operation.get('service_key') %}
+{#- Step count only from a real "n/N" core stage label; never estimated. -#}
+{% set ns = namespace(step=none) %}
+{% for event in timeline %}{% if stage_step(event.get('stage')) %}{% set ns.step = stage_step(event.get('stage')) %}{% endif %}{% endfor %}
+{% if stage_step(operation.get('current_stage')) %}{% set ns.step = stage_step(operation.get('current_stage')) %}{% endif %}
+{% block title %}{{ operation.get('service') or 'Service' }} {{ operation_name }}{% endblock %}
+{% block heading %}{{ operation.get('service') or 'Service' }} {{ operation_name }}{% endblock %}
+{% block page_breadcrumb %}
+  <nav class="page-breadcrumb" aria-label="Breadcrumb">
+    <ol class="breadcrumb">
+      <li class="breadcrumb-item"><a href="/services">Services</a></li>
+      {% if current_service_key %}<li class="breadcrumb-item"><a href="/services/{{ current_service_key|urlencode }}" data-operation-service-link>{{ operation.get('service') or 'Service' }}</a></li>{% endif %}
+      <li class="breadcrumb-item active" aria-current="page">{{ operation_name|title }}</li>
+    </ol>
+  </nav>
+{% endblock %}
+{% block page_subtitle %}
+  <p class="page-meta operation-header-context">
+    <span>{{ ('Establish configuration trust' if operation.get('kind') == 'compose_bootstrap' else 'Discard configuration' if ((operation.get('result') or {}).get('action') or (operation.get('summary') or {}).get('action')) == 'discard' else 'Apply configuration') if is_compose else 'Single-service ' ~ operation_name }} · {{ operation.get('stack') or 'Compose stack' }}</span>
+    <span class="badge {{ view.badge_class }}{% if operation.get('kind') == 'compose_bootstrap' %} bootstrap-status{% endif %}" data-operation-status>{{ view.status_label }}</span>
+  </p>
+{% endblock %}
+{% block content_class %} content-narrow{% endblock %}
+{% block content %}
+  <section class="card operation-panel" aria-labelledby="operation-title"
+           data-operation-progress data-operation-id="{{ operation.get('id') }}"
+           data-cursor="{{ operation.get('last_event_id', 0) }}" data-status="{{ operation.get('status') }}"
+           data-kind="{{ operation.get('kind') }}" data-outcome="{{ view.outcome }}">
+    <h2 class="visually-hidden" id="operation-title">{{ operation_name|title }} progress</h2>
+    <div class="card-body operation-body">
+      <div class="operation-current">
+        <span class="operation-state-icon" data-operation-state-icon aria-hidden="true"></span>
+        <div class="operation-stage-current">
+          <p class="operation-current-stage" data-operation-stage aria-live="polite">
+            {{ view.stage }}
+          </p>
+          {% if not terminal and active_event and active_event.get('message') %}
+            <p class="operation-stage-detail" data-operation-stage-detail aria-live="polite">{{ active_event.get('message') }}</p>
+          {% elif not terminal and operation.get('status') == 'queued' %}
+            <p class="operation-stage-detail" data-operation-stage-detail aria-live="polite">Waiting for the UPT worker to begin.</p>
+          {% elif terminal %}
+            <p class="operation-stage-detail" data-operation-stage-detail aria-live="polite">Operation result saved in UPT History.</p>
+          {% endif %}
+        </div>
+        <span class="operation-step" data-operation-step {% if terminal or not ns.step %}hidden{% endif %}>{% if ns.step %}Step {{ ns.step[0] }} of {{ ns.step[1] }}{% endif %}</span>
+      </div>
+      {% set meter_total = ns.step[1] if ns.step else 1 %}
+      {% set meter_value = ns.step[0] - 1 if ns.step else 0 %}
+      <progress class="meter operation-meter" data-operation-meter max="{{ meter_total }}" value="{{ meter_value }}"
+                aria-label="{{ operation_name|title }} steps completed"
+                {% if not ns.step %}data-indeterminate{% endif %} {% if terminal %}hidden{% endif %}></progress>
+      {% if not terminal %}
+        <p class="operation-connection" data-operation-connection aria-live="polite">Progress is saved on the server and resumes from the last event after a reload.</p>
+      {% endif %}
+
+      {% if terminal %}
+        <div class="alert {{ view.alert_class }} operation-terminal-result" role="{{ view.alert_role }}" {% if view.error %}data-operation-error{% endif %}>{{ view.alert }}</div>
+      {% endif %}
+
+      {% if view.result_facts %}
+        <section class="operation-result" aria-label="{{ operation_name|title }} image result">
+          <h3>{{ 'Restored image' if is_rollback else 'Deployed image' }}</h3>
+          <dl class="kv-grid operation-result-facts">
+            {% for fact in view.result_facts %}<div><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div>{% endfor %}
+          </dl>
+          <details class="identity-disclosure">
+            <summary>Show exact image reference and digest</summary>
+            <dl class="exact-identity-facts">
+              {% if operation_result.get('image') %}<div><dt>Image reference</dt><dd><code class="technical-value">{{ operation_result.get('image') }}</code></dd></div>{% endif %}
+              {% if operation_result.get('digest') %}<div><dt>Exact digest</dt><dd><code class="technical-value">{{ operation_result.get('digest') }}</code></dd></div>{% endif %}
+            </dl>
+          </details>
+        </section>
+      {% endif %}
+
+      <details class="operation-log" data-operation-log {% if not terminal %}open{% endif %}>
+        <summary>{{ icon('chevron-down', 'disclosure-chevron') }}<span>Stage log</span> <span class="operation-log-count" data-operation-log-count>{{ timeline|length }} {{ 'event' if timeline|length == 1 else 'events' }}</span></summary>
+        <ol class="operation-event-list" data-operation-events aria-label="{{ operation_name|title }} stages">
+          {% for event in timeline %}
+            {% set terminal_event = event.get('kind') in ['operation_completed', 'operation_failed', 'operation_blocked'] %}
+            <li data-event-id="{{ event.get('id') }}" data-event-status="{{ event.get('status') or '' }}"
+                data-event-role="{{ event.get('_timeline_role') }}"
+                data-stage-key="{{ event.get('stage') or '' }}" data-stage-active="{{ 'true' if event.get('_timeline_active') else 'false' }}"
+                {% if terminal_event %}data-terminal-event="true"{% endif %}>
+              <span class="op-step-icon" aria-hidden="true"></span>
+              <span class="op-step-name">{{ event.get('stage') or event.get('kind') }}</span>
+              {% if not terminal_event and event.get('message') %}<span class="op-step-message">{{ event.get('message') }}</span>{% endif %}
+            </li>
+          {% endfor %}
+        </ol>
+      </details>
+    </div>
+    <div class="card-footer operation-footer">
+      {% if current_service_key %}<a href="/services/{{ current_service_key|urlencode }}" data-operation-service-link>Back to {{ operation.get('service') or 'service' }}</a>{% endif %}
+      <a href="/history">View History and audit records</a>
+    </div>
+  </section>
+{% endblock %}
+{% block page_scripts %}<script src="{{ url_for('static', path='operation.js') }}" defer></script>{% endblock %}

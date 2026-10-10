@@ -1,0 +1,19 @@
+auto_pin_after_update: false
+health_timeout: 90
+conversion_root: /root
+retention:
+  recovery_days: 7
+  compose_backups_days: 7
+  rollback_images_days: 7
+  operational_logs_days: 7
+  temporary_files_days: 7
+  disk_history_days: 30
+  audit_history_days: 365
+  resolved_rollback_metadata_days: 30
+exclude:
+  services: []
+  images: []
+  stacks: []
+services:
+  sonarr:
+    policy: manual

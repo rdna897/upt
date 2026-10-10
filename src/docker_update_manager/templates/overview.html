@@ -1,0 +1,185 @@
+{% extends "base.html" %}
+{% from "_ui.html" import icon, local_time, freshness_meta, scan_button, scan_progress %}
+{% block title %}Overview{% endblock %}
+{% block heading %}Overview{% endblock %}
+{% block page_header_context %}
+  <p class="page-meta">{{ freshness_meta(runtime, snapshot, scan, snapshot_trustworthy) }}</p>
+{% endblock %}
+{% block page_actions %}{{ scan_button(scan, csrf) }}{% endblock %}
+{% block content %}
+  {% set payload = snapshot.get('payload', {}) %}
+  {% set results = merged_items|rejectattr('runtime_only')|rejectattr('status', 'in', ['CHECK REQUIRED', 'NOT SCANNED'])|list %}
+  {% set summary_last_known = not (merged_items|selectattr('verification_fresh')|list) %}
+  {% set update_statuses = ['UPDATE', 'DIGEST CHANGED', 'PINNED UPDATE'] %}
+  {% set pinned_statuses = ['PINNED', 'PINNED UPDATE', 'UNTRACKED DIGEST'] %}
+  {% set scan_active = scan and scan.get('status') in ['running', 'finalizing'] %}
+  {% set update_count = results|selectattr('status', 'in', update_statuses)|list|length %}
+
+  {% if health.get('_error') %}
+    <div class="alert alert-danger" role="alert">{{ icon('alert') }}<div><strong>Agent unavailable.</strong> Cached information cannot be refreshed right now.</div></div>
+  {% elif health.get('docker', {}).get('ok') is sameas false %}
+    <div class="alert alert-warning" role="status">{{ icon('alert') }}<div><strong>The Docker liveness check failed.</strong> Runtime freshness is shown separately below.</div></div>
+  {% elif not snapshot_available %}
+    <div class="alert alert-danger" role="alert">{{ icon('alert') }}<div><strong>Service data unavailable.</strong> The UPT agent could not load the cached snapshot.</div></div>
+  {% endif %}
+  {% if component_versions and component_versions.get('status') in ['mismatch', 'unknown'] %}
+    <div class="alert alert-danger" role="alert" data-version-status="{{ component_versions.get('status') }}">{{ icon('alert') }}<div><strong>UPT web and agent versions do not match.</strong> Complete the UPT upgrade before making changes. Read-only information remains available.</div></div>
+  {% endif %}
+  {% if runtime.get('status') in ['unavailable', 'stale'] %}
+    <div class="alert alert-warning runtime-unavailable" role="status" data-runtime-availability="{{ runtime.get('status') }}">
+      {{ icon('alert') }}
+      <p class="runtime-unavailable-copy mb-0">
+        <strong>{% if runtime.get('status') == 'unavailable' %}{{ runtime|runtime_failure_message }}.{% else %}Runtime snapshot is stale.{% endif %}</strong>
+        {% if runtime.get('last_success_at') %}<span>Container states below are last known as of {{ local_time(runtime.get('last_success_at')) }}.</span>{% else %}<span>No successful container snapshot is available yet.</span>{% endif %}
+      </p>
+    </div>
+  {% endif %}
+
+  {% if scan and not scan.get('_error') and not scan_active %}
+    {% if scan.get('status') == 'partial' %}
+      <div class="alert alert-warning" role="status" data-scan-result="partial">
+        {{ icon('alert') }}
+        <div>
+          <strong>Latest scan attempt finished with incomplete service results.</strong>
+          The displayed inventory remains the previous complete snapshot; individual service checks may be newer.
+          {% if scan.get('error') %}<span>{{ scan.get('error') }}</span>{% endif %}
+          {% if scan.get('diagnostics') %}
+            <details class="partial-diagnostics" data-partial-diagnostics>
+              <summary>Show unverified services from the latest attempt (up to 5)</summary>
+              <ul class="mb-0">
+                {% for item in scan.get('diagnostics', []) %}
+                  <li>{{ item.get('service') }}: {{ item.get('status')|status_label }} — {{ item.get('message') }}</li>
+                {% endfor %}
+              </ul>
+            </details>
+          {% endif %}
+        </div>
+      </div>
+    {% elif scan.get('status') in ['failed', 'stale'] %}
+      <div class="alert alert-danger" role="alert" data-scan-result="failed">
+        {{ icon('alert') }}
+        <div>
+          <strong>Last scan failed.</strong>
+          Previous saved service results are still available.
+          {% if scan.get('error') %}<span>{{ scan.get('error') }}</span>{% endif %}
+        </div>
+      </div>
+    {% endif %}
+  {% endif %}
+  {% if scan and scan.get('maintenance_warning') %}
+    <div class="alert alert-warning" role="status" data-scan-maintenance-warning>
+      {{ icon('alert') }}<div>The scan result was saved, but post-scan housekeeping reported: {{ scan.get('maintenance_warning') }}.</div>
+    </div>
+  {% endif %}
+
+  {{ scan_progress(scan) }}
+
+  <div class="overview-grid">
+    <div class="overview-side">
+    <section class="runtime-health-section" aria-labelledby="runtime-health-title">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title" id="runtime-health-title">Runtime health</h2>
+            <p class="card-subtitle">Local Docker state, independent of registry scans</p>
+          </div>
+          <a class="btn btn-sm btn-outline-secondary" href="/services">View services</a>
+        </div>
+        {% if runtime.get('status') == 'current' and runtime.get('captured_at') and not runtime.get('containers') %}
+          <div class="empty-state" role="status"><p class="mb-0">No containers were found in the latest runtime snapshot.</p></div>
+        {% elif runtime.get('status') in ['unavailable', 'never'] and not runtime.get('last_success_at') %}
+          <div class="empty-state" role="status" data-runtime-snapshot="unavailable"><p class="mb-0"><strong>Runtime information is not available yet.</strong> UPT has not completed a successful Docker runtime check.</p></div>
+        {% elif runtime.get('captured_at') or runtime.get('containers') %}
+          {% set attention = runtime_summary.get('attention', 0) %}
+          <div class="summary-grid stat-strip runtime-summary-grid" aria-label="Runtime summary">
+            <div class="summary-card stat">
+              <span class="stat-label">{{ 'Last-known containers' if runtime_stale else 'Containers' }}</span>
+              <strong class="stat-value">{{ runtime_summary.get('total', 0) }}</strong>
+            </div>
+            <div class="summary-card stat">
+              <span class="stat-label">Running</span>
+              <strong class="stat-value">{{ runtime_summary.get('running', 0) }}</strong>
+            </div>
+            <div class="summary-card stat">
+              <span class="stat-label">Healthcheck healthy</span>
+              <strong class="stat-value">{{ runtime_summary.get('healthy', 0) }}</strong>
+            </div>
+            <div class="summary-card stat{% if attention %} is-danger{% endif %}">
+              <span class="stat-label">Runtime attention</span>
+              <strong class="stat-value">{{ attention }}</strong>
+            </div>
+          </div>
+          <p class="runtime-summary-detail">
+            <span>{{ runtime_summary.get('no_healthcheck', 0) }} running without a healthcheck</span>
+            <span>{{ runtime_summary.get('starting', 0) }} healthcheck starting</span>
+            <span>{{ runtime_summary.get('unhealthy', 0) }} unhealthy</span>
+            <span>{{ runtime_summary.get('restarting', 0) }} restarting</span>
+            <span>{{ runtime_summary.get('non_running', 0) }} non-running</span>
+          </p>
+          {% if runtime_stale %}<p class="runtime-last-known-note">These are last-known Docker states and are not presented as current.</p>{% endif %}
+        {% elif runtime.get('_error') %}
+          <div class="empty-state" role="status"><p class="mb-0">No runtime snapshot is available yet. The agent collects Docker state in the background.</p></div>
+        {% else %}
+          <div class="empty-state" role="status"><p class="mb-0">Runtime information is not available yet.</p></div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="maintenance-section" aria-labelledby="maintenance-title">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title" id="maintenance-title">Maintenance</h2>
+            <p class="card-subtitle">{{ 'Last complete inventory · update facts unverified for current runtime' if summary_last_known else 'From current service checks and inventory scans' }}</p>
+          </div>
+          <a class="btn btn-sm btn-outline-secondary" href="/updates">View updates</a>
+        </div>
+        {% if results %}
+          <div class="summary-grid stat-strip maintenance-summary-grid" aria-label="Maintenance summary">
+            <div class="summary-card stat"><span class="stat-label">{{ 'Scanned services' if summary_last_known else 'Checked services' }}</span><strong class="stat-value">{{ results|length }}</strong></div>
+            <a class="summary-card stat stat-link{% if update_count %} is-info{% endif %}" href="/updates"><span class="stat-label">Updates available</span><strong class="stat-value">{{ update_count }}</strong></a>
+            <div class="summary-card stat"><span class="stat-label">Pinned</span><strong class="stat-value">{{ results|selectattr('status', 'in', pinned_statuses)|list|length }}</strong></div>
+          </div>
+        {% else %}
+          <div class="empty-state" role="status"><p class="mb-0">Open a service to check its update information, or run an inventory scan.</p></div>
+        {% endif %}
+      </div>
+    </section>
+    </div>
+
+    <section class="card attention-panel" aria-labelledby="attention-title">
+      <div class="card-header">
+        <h2 class="card-title" id="attention-title">Needs attention <span class="badge {{ 'status-danger' if attention_count else 'status-neutral' }} count-badge">{{ attention_count }}</span></h2>
+        <a class="btn btn-sm btn-outline-secondary" href="/services">View all services</a>
+      </div>
+      {% if attention_items %}
+        <ul class="attention-list" role="list">
+          {% for item in attention_items %}
+            {% set service = item.get('service', {}) %}
+            <li>
+              <a class="attention-row" href="/services/{{ service.get('key', '')|urlencode }}">
+                <span class="attention-identity">
+                  <strong>{{ service.get('name') or service.get('key', 'Unknown service') }}</strong>
+                  <small>{{ service.get('stack') or 'Standalone' }}</small>
+                </span>
+                <span class="attention-facts">
+                  {% if item.get('runtime_issue_label') %}<span class="badge {{ item.get('runtime_issue')|status_class }}">{{ item.get('runtime_issue_label') }}</span>{% endif %}
+                  {% if item.get('maintenance_attention') %}<span class="badge {{ item.get('status')|status_class }}">{{ item.get('maintenance_label') if item.get('maintenance_label') != item.get('status') else item.get('status')|status_label }}</span>{% elif item.get('runtime_only') %}<span class="badge status-neutral">Not scanned</span>{% endif %}
+                </span>
+                {{ icon('chevron-right', 'row-chevron') }}
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+        {% if attention_count > attention_items|length %}
+          <div class="card-footer"><a href="/services">{{ attention_count - attention_items|length }} more in Services</a></div>
+        {% endif %}
+      {% else %}
+        <div class="empty-state is-positive">
+          {{ icon('check') }}
+          <p class="mb-0">No runtime or maintenance attention items are currently known.</p>
+        </div>
+      {% endif %}
+    </section>
+  </div>
+{% endblock %}

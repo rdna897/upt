@@ -1,0 +1,37 @@
+{% extends "auth_base.html" %}
+{% block title %}First-run setup{% endblock %}
+{% block heading %}Create administrator{% endblock %}
+{% block intro %}
+  <p class="auth-intro">
+    Enter the one-time setup code printed by <code>upt web bootstrap</code>.
+    No default password exists.
+  </p>
+{% endblock %}
+{% block content %}
+  <form method="post" class="auth-form" data-busy-form>
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="field">
+      <label class="form-label" for="setup-code">Setup code</label>
+      <input class="form-control" id="setup-code" name="bootstrap"
+             autocomplete="one-time-code" autocapitalize="none" spellcheck="false" required>
+    </div>
+    <div class="field">
+      <label class="form-label" for="setup-username">Username</label>
+      <input class="form-control" id="setup-username" name="username"
+             autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="80">
+    </div>
+    <div class="field">
+      <label class="form-label" for="setup-password">Password</label>
+      <input class="form-control" id="setup-password" type="password" aria-describedby="setup-password-hint"
+             name="password" autocomplete="new-password" minlength="12" required>
+      <div class="form-hint" id="setup-password-hint">Use at least 12 characters.</div>
+    </div>
+    <div class="field">
+      <label class="form-label" for="setup-password-confirm">Confirm password</label>
+      <input class="form-control" id="setup-password-confirm" type="password"
+             name="password_confirm" autocomplete="new-password" minlength="12" required>
+    </div>
+    <button class="btn btn-primary btn-block" type="submit" data-busy-label="Creating…">Create administrator</button>
+  </form>
+{% endblock %}
+{% block after_card %}<p class="auth-help">The code expires and cannot be reused after successful setup.</p>{% endblock %}

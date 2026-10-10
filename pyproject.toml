@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docker-update-manager"
+dynamic = ["version"]
+description = "Safety-first Docker and Compose update manager"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0,<7", "rich>=13.7,<15", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "Jinja2>=3.1,<4", "argon2-cffi>=23.1,<26", "python-multipart>=0.0.9,<1"]
+
+[project.optional-dependencies]
+test = ["httpx2>=2,<3"]
+browser-test = ["playwright>=1.55,<2"]
+
+[project.scripts]
+upt = "docker_update_manager.cli:main"
+upt-agent = "docker_update_manager.webcli:agent_main"
+upt-web = "docker_update_manager.webcli:web_main"
+
+[tool.setuptools.dynamic]
+version = {attr = "docker_update_manager._version.__version__"}
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+docker_update_manager = ["templates/*.html", "static/*"]

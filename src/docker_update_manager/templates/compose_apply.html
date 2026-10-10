@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% from "_ui.html" import review_header, review_fact, review_confirmation, compose_changes %}
+{% block title %}{{ review.get('service') }} configuration{% endblock %}
+{% block heading %}{{ review.get('service') }} configuration{% endblock %}
+{% block page_breadcrumb %}
+  <nav class="page-breadcrumb" aria-label="Breadcrumb">
+    <ol class="breadcrumb">
+      <li class="breadcrumb-item"><a href="/services">Services</a></li>
+      <li class="breadcrumb-item"><a href="/services/{{ service_key|urlencode }}">{{ review.get('service') }}</a></li>
+      <li class="breadcrumb-item active" aria-current="page">Configuration</li>
+    </ol>
+  </nav>
+{% endblock %}
+{% block page_subtitle %}<p class="page-meta">Review changes · {{ review.get('stack') }}</p>{% endblock %}
+{% block content_class %} content-narrow{% endblock %}
+{% block content %}
+  {% set discard = compose_action == 'discard' %}
+  {% set namespace = review.get('namespace') if not discard and review.get('namespace') is mapping else none %}
+  <section class="card update-confirmation" aria-labelledby="compose-apply-title">
+    {{ review_header('Review configuration changes', 'Discard the reviewed source changes while the running service stays unchanged.' if discard else 'Confirm the reviewed Compose changes before UPT recreates this service.', 'compose-apply-title') }}
+    <div class="card-body">
+      <div class="review-identity">
+        {{ review_fact('Action', 'Discard source changes' if discard else 'Recreate service') }}
+        {{ review_fact('Image', 'Unchanged · no pull') }}
+        {{ review_fact('Recovery', 'Copy of current pending source' if discard else 'Automatic from trusted configuration') }}
+        {% if namespace %}{{ review_fact('Network namespace', 'Shares the network namespace of ' ~ namespace.get('owner') ~ '; the owner will not be changed.') }}{% endif %}
+      </div>
+      {% if discard %}<p class="fact-note">The running service will not be recreated or restarted. Its image will not change or be pulled. A recovery copy of the current pending source will be held while the operation completes.</p>{% endif %}
+      <div>
+        <h3 class="card-title compose-changes-title">Changes</h3>
+        {{ compose_changes(review.get('service_changes', [])) }}
+      </div>
+      <p class="fact-note">Environment variables and labels are shown by name only. Secret-bearing fields are reported only as changed.</p>
+      <form class="update-confirmation-form" method="post" action="/operations/compose-reconcile" data-compose-confirmation data-busy-form>
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="confirmation_id" value="{{ confirmation_id }}">
+        {% if discard %}
+          {{ review_confirmation('confirm_apply', 'I confirm discarding the reviewed source changes for ' ~ review.get('service') ~ '.', 'Discard changes', 'Starting Discard…', 'UPT restores only the proven source value ranges to the trusted running configuration. The running service stays unchanged.', checkbox_id='confirm-discard') }}
+        {% elif namespace %}
+        {{ review_confirmation('confirm_apply', 'I confirm applying the reviewed configuration changes to ' ~ review.get('service') ~ '.', 'Apply configuration', 'Starting Apply…', 'UPT recreates only this service without pulling an image or recreating dependencies. The image and ' ~ namespace.get('owner') ~ ' are not changed. Automatic recovery is attempted only if startup or health checks fail while ' ~ namespace.get('owner') ~ ' remains exactly unchanged; otherwise manual recovery can be necessary. Recovery restores the previous Compose configuration only: desired changes remain pending, and application data and database migrations are not rolled back.', checkbox_id='confirm-apply') }}
+        {% else %}
+        {{ review_confirmation('confirm_apply', 'I confirm applying the reviewed configuration changes to ' ~ review.get('service') ~ '.', 'Apply configuration', 'Starting Apply…', 'UPT recreates only this service without pulling an image or recreating dependencies. If startup or health checks fail, UPT will attempt recovery using the trusted previous configuration. Recovery cannot undo application data changes or database migrations.', checkbox_id='confirm-apply') }}
+        {% endif %}
+      </form>
+    </div>
+    <div class="card-footer"><a href="/services/{{ service_key|urlencode }}">Back to {{ review.get('service') }}</a></div>
+  </section>
+{% endblock %}

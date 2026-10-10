@@ -1,0 +1,24 @@
+[Unit]
+Description=UPT unprivileged authenticated web service
+After=upt-agent.service
+Requires=upt-agent.service
+
+[Service]
+Type=simple
+Environment=UPT_WEB_CONFIG=/etc/docker-update-manager/web.yml
+Environment=UPT_WEB_STATE_DIR=/var/lib/docker-update-manager-web
+ExecStart=/usr/local/bin/upt-web
+User=docker-update-manager-web
+Group=docker-update-manager-web
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/docker-update-manager-web
+
+[Install]
+WantedBy=multi-user.target

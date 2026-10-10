@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% from "_ui.html" import icon, local_time %}
+{% block title %}Settings{% endblock %}
+{% block heading %}Settings{% endblock %}
+{% block page_subtitle %}<p class="page-meta"><span class="page-meta-item">Administrator account, appearance and system status</span></p>{% endblock %}
+{% block content_class %} content-medium{% endblock %}
+{% block content %}
+  {% if message %}<div class="alert alert-success" role="status">{{ icon('check') }}<div>{{ message }}</div></div>{% endif %}
+  {% if error %}<div class="alert alert-danger" role="alert">{{ icon('alert') }}<div>{{ error }}</div></div>{% endif %}
+  {% if session_policy and session_policy.shorter_than_default %}<div class="alert alert-warning" role="status">{{ icon('alert') }}<div>Session lifetime is configured shorter than the 30-day defaults (<code>session_idle_minutes</code> / <code>session_absolute_hours</code> in <code>web.yml</code>). Upgrades do not overwrite this operator setting.</div></div>{% endif %}
+  <div class="settings-grid">
+    <section class="card settings-administrator" aria-labelledby="settings-administrator-title">
+      <div class="card-header">
+        <h2 class="card-title" id="settings-administrator-title">Administrator</h2>
+      </div>
+      <div class="card-body">
+        <div class="account-summary">
+          <span class="app-avatar is-large" aria-hidden="true">{{ (user.get('username') or '?')[:1]|upper }}</span>
+          <dl class="kv-list settings-facts">
+            <dt>Username</dt>
+            <dd><span class="settings-identity" aria-label="Full username: {{ user.get('username') }}"
+                     title="Full username: {{ user.get('username') }}">{{ user.get('username') }}</span></dd>
+            <dt>Created</dt>
+            <dd>{{ local_time(user.get('created_at')) }}</dd>
+            {% if session and session.get('absolute_expires_at') %}
+              <dt>This session</dt>
+              <dd>Signed in until <time data-local-date datetime="{{ session.get('absolute_expires_at')|utc_timestamp }}">{{ (session.get('absolute_expires_at') or '')[:10] }}</time> at the latest</dd>
+            {% endif %}
+            {% if session_policy %}
+              <dt>Idle timeout</dt>
+              <dd>{{ session_policy.idle_label }}</dd>
+              <dt>Maximum session length</dt>
+              <dd>{{ session_policy.absolute_label }}</dd>
+            {% endif %}
+          </dl>
+        </div>
+        <form method="post" action="/logout" class="account-actions">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="btn btn-outline-secondary" type="submit">{{ icon('signout') }}<span>Sign out of this session</span></button>
+        </form>
+
+        <details class="settings-subsection">
+          <summary class="subsection-title">Change password {{ icon('chevron-down', 'disclosure-chevron') }}</summary>
+          <p class="subsection-copy">Changing the password signs out every session, including this one.</p>
+          <form method="post" action="/settings/password" class="settings-form" data-busy-form>
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <div class="field">
+              <label class="form-label" for="current-password">Current password</label>
+              <input class="form-control" id="current-password" type="password"
+                     name="current_password" autocomplete="current-password" required>
+            </div>
+            <div class="field">
+              <label class="form-label" for="new-password">New password</label>
+              <input class="form-control" id="new-password" type="password" aria-describedby="new-password-hint"
+                     name="new_password" autocomplete="new-password" minlength="12" required>
+              <div class="form-hint" id="new-password-hint">Use at least 12 characters.</div>
+            </div>
+            <div class="field">
+              <label class="form-label" for="new-password-confirm">Confirm new password</label>
+              <input class="form-control" id="new-password-confirm" type="password"
+                     name="new_password_confirm" autocomplete="new-password" minlength="12" required>
+            </div>
+            <div class="form-actions">
+              <button class="btn btn-primary" type="submit" data-busy-label="Changing password…">Change password</button>
+            </div>
+          </form>
+        </details>
+      </div>
+    </section>
+    <div class="settings-secondary-sections">
+      <section class="card settings-appearance" aria-labelledby="settings-appearance-title">
+        <div class="card-header">
+          <h2 class="card-title" id="settings-appearance-title">Appearance</h2>
+        </div>
+        <div class="card-body">
+          <div class="field">
+            <label class="form-label" for="theme-select">Theme</label>
+            <select class="form-select theme-select" id="theme-select" data-theme-select aria-describedby="theme-hint">
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+            <p class="form-hint" id="theme-hint">Stored in this browser. System follows your device preference.</p>
+          </div>
+        </div>
+      </section>
+      <section class="card settings-system" aria-labelledby="settings-system-title">
+        <div class="card-header">
+          <h2 class="card-title" id="settings-system-title">System status</h2>
+        </div>
+        <div class="card-body">
+          <dl class="kv-list settings-facts">
+            <dt>Agent</dt>
+            <dd>
+              {% if health.get('_error') %}
+                <span class="badge status-danger">Unavailable</span>
+              {% else %}
+                <span class="badge status-success">Reachable</span>
+              {% endif %}
+            </dd>
+            <dt>Docker</dt>
+            <dd>
+              {% if health.get('docker', {}).get('ok') is sameas false %}
+                <span class="badge status-danger">Unavailable</span>
+              {% elif health.get('docker', {}).get('ok') is sameas true %}
+                <span class="badge status-success">Available</span>
+              {% else %}
+                <span class="badge status-neutral">Not checked</span>
+              {% endif %}
+            </dd>
+            <dt>Web version</dt>
+            <dd>{{ version }}</dd>
+            {% set versions = component_versions or {} %}
+            <dt>Agent version</dt>
+            <dd>{{ versions.get('agent') or ('Unavailable' if versions.get('status') == 'unavailable' else 'Unknown') }}</dd>
+            <dt>Version status</dt>
+            <dd data-version-status="{{ versions.get('status', 'unavailable') }}">
+              {% if versions.get('status') == 'match' %}
+                <span class="badge status-success">Versions match</span>
+              {% elif versions.get('status') == 'unavailable' %}
+                <span class="badge status-neutral">Not checked</span>
+              {% else %}
+                <span class="badge status-danger">Upgrade incomplete</span>
+              {% endif %}
+            </dd>
+            <dt>Web access</dt>
+            <dd>Read-only scans; confirmed service updates</dd>
+          </dl>
+          <p class="fact-note">The web service uses a bounded local agent and never accesses the Docker socket directly.</p>
+        </div>
+      </section>
+    </div>
+  </div>
+{% endblock %}

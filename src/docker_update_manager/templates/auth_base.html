@@ -1,0 +1,32 @@
+{% from "_ui.html" import icon, sprite %}
+<!doctype html>
+<html lang="en" data-theme="light" data-bs-theme="light">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
+    <title>{% block title %}Sign in{% endblock %} · UPT</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='tabler.min.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+    <script src="{{ url_for('static', path='theme.js') }}"></script>
+  </head>
+  <body class="auth-page">
+    {{ sprite() }}
+    <main class="auth-layout">
+      <a class="app-brand auth-brand" href="/" aria-label="UPT">
+        <span class="brand-mark" aria-hidden="true">U</span>
+        <span class="brand-name">UPT</span>
+      </a>
+      <section class="card auth-card" aria-labelledby="auth-title">
+        <h1 class="auth-title" id="auth-title">{% block heading %}UPT{% endblock %}</h1>
+        {% block intro %}{% endblock %}
+        {% if error %}<div class="alert alert-danger" role="alert">{{ icon('alert') }}<div>{{ error }}</div></div>{% endif %}
+        {% block content %}{% endblock %}
+      </section>
+      {% block after_card %}{% endblock %}
+      <p class="auth-foot">UPT {{ version }} · Safety-first Docker updates</p>
+    </main>
+    <script src="{{ url_for('static', path='htmx.min.js') }}" defer></script>
+    <script src="{{ url_for('static', path='app.js') }}" defer></script>
+  </body>
+</html>

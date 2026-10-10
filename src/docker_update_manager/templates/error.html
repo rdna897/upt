@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% from "_ui.html" import icon %}
+{% block title %}{{ title }}{% endblock %}
+{% block heading %}{{ title }}{% endblock %}
+{% block content %}
+  <section class="card app-state-card" role="status">
+    <div class="card-body app-state-panel">
+      <div class="empty-state">
+        {{ icon('info') }}
+        <div class="app-state-content">
+          <p class="mb-0">{{ message }}</p>
+          <div class="app-state-actions">
+            <a class="btn btn-outline-secondary" href="/">Return to overview</a>
+            <a class="btn btn-ghost" href="/services">View services</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}

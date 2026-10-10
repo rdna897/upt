@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% from "_ui.html" import icon, local_time %}
+{% block title %}History{% endblock %}
+{% block heading %}History{% endblock %}
+{% block page_subtitle %}<p class="page-meta"><span class="page-meta-item">Security, scan and operation activity. Secrets and session values are never stored here.</span></p>{% endblock %}
+{% block content %}
+  {% if error %}
+    <div class="alert alert-warning" role="status">{{ icon('alert') }}<div>Remote audit history is temporarily unavailable.</div></div>
+  {% endif %}
+  <section class="card history-panel" aria-label="Recent activity">
+    {% if events %}
+      <div class="table-responsive">
+      <table class="table data-table history-table">
+        <thead>
+          <tr>
+            <th scope="col">Time</th>
+            <th scope="col">Action</th>
+            <th scope="col">Result</th>
+            <th scope="col">Actor</th>
+            <th scope="col">Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for event in events %}
+            {% set action = event.get('action') or 'Unknown' %}
+            {% set outcome = event.get('result') or 'Unknown' %}
+            <tr>
+              <td data-label="Time" class="cell-time">{{ local_time(event.get('timestamp')) }}</td>
+              <td data-label="Action" class="cell-action"><span title="{{ action }}">{{ 'Compose reconciliation · Apply' if action == 'web_compose_reconcile' else action|replace('_', ' ')|capitalize }}</span></td>
+              <td data-label="Result"><span class="badge {{ outcome|status_class }}">{{ outcome|replace('_', ' ')|capitalize }}</span></td>
+              <td data-label="Actor">{{ event.get('username') or 'System' }}</td>
+              <td data-label="Source" class="cell-muted">{{ event.get('client_ip') or 'Not recorded' }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <div class="card-body app-state-panel" role="status">
+        <div class="empty-state">
+          {{ icon('history') }}
+          <div class="app-state-content">
+            <h2 class="empty-state-title">No activity yet</h2>
+            <p class="mb-0">No activity has been recorded yet. Read-only scans and security events will appear here.</p>
+          </div>
+        </div>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}

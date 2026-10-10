@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% from "_ui.html" import icon, freshness_meta, scan_button, scan_progress, runtime_state, version_value %}
+{% block title %}Updates{% endblock %}
+{% block heading %}Updates{% endblock %}
+{% block page_header_context %}
+  <p class="page-meta">{{ freshness_meta(runtime, snapshot, scan, snapshot_trustworthy, show_runtime=False) }}</p>
+{% endblock %}
+{% block page_actions %}{{ scan_button(scan, csrf) }}{% endblock %}
+
+{% macro service_cell(item) -%}
+  {% set service = item.get('service', {}) %}
+  <a class="cell-title" href="/services/{{ service.get('key', '')|urlencode }}">{{ service.get('name') or service.get('key', 'Unknown service') }}</a>
+  <span class="cell-sub"><span>{{ service.get('stack') or 'Standalone' }}</span>{% set repository = display_repository(service.get('image')) %}{% if repository %}<code class="cell-image" title="{{ service.get('image') }}">{{ repository.split('/', 1)[-1] }}</code>{% endif %}</span>
+{%- endmacro %}
+
+{% block content %}
+  {% if not snapshot_available %}
+    <div class="alert alert-danger" role="alert">{{ icon('alert') }}<div><strong>Update data unavailable.</strong> The UPT agent could not return the cached snapshot. This is not an empty result.</div></div>
+  {% endif %}
+  {% if scan and not scan.get('_error') and scan.get('status') in ['partial', 'failed', 'stale'] %}
+    <div class="alert alert-warning" role="status">{{ icon('alert') }}<div><strong>The latest inventory scan did not complete.</strong> The previous complete inventory remains available; individual service checks may be newer.</div></div>
+  {% endif %}
+
+  {{ scan_progress(scan) }}
+
+  {% if snapshot_available and evidence_available %}
+    {% set available = groups['update'] %}
+    {% set undetermined = groups['undetermined'] %}
+    {% set current = groups['current'] %}
+    <ul class="summary-pills" aria-label="Update summary">
+      <li class="{{ 'is-info' if available else '' }}"><strong>{{ available|length }}</strong> available</li>
+      <li class="{{ 'is-warning' if undetermined else '' }}"><strong>{{ undetermined|length }}</strong> could not be checked</li>
+      <li><strong>{{ current|length }}</strong> up to date or pinned</li>
+      {% if groups['excluded'] %}<li><strong>{{ groups['excluded']|length }}</strong> excluded from checks</li>{% endif %}
+    </ul>
+
+    <section class="card updates-available" aria-labelledby="updates-available-title">
+      <div class="card-header">
+        <h2 class="card-title" id="updates-available-title">Available updates</h2>
+      </div>
+      {% if available %}
+        <div class="table-responsive">
+        <table class="table data-table updates-table">
+          <thead>
+            <tr>
+              <th scope="col">Service</th>
+              <th scope="col">Current</th>
+              <th scope="col" class="col-arrow"><span class="visually-hidden">to</span></th>
+              <th scope="col">Available</th>
+              <th scope="col">Runtime</th>
+              <th scope="col" class="col-action"><span class="visually-hidden">Action</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for entry in available %}
+              {% set item = entry.item %}
+              <tr>
+                <td class="cell-service">{{ service_cell(item) }}</td>
+                <td data-label="Current">{{ version_value(entry.identity.current) }}</td>
+                <td class="col-arrow" aria-hidden="true">{{ icon('arrow-right') }}</td>
+                <td data-label="Available"><span class="cell-value">
+                  {{ version_value(entry.identity.available) }}
+                  {% if item.get('status') != 'UPDATE' %}<span class="badge {{ item.get('status')|status_class }}">{{ item.get('status')|status_label }}</span>{% endif %}
+                </span></td>
+                <td data-label="Runtime">{{ runtime_state(item.get('runtime'), item.get('runtime_stale'), item.get('runtime_missing')) }}</td>
+                <td class="col-action">
+                  <a class="btn btn-sm btn-outline-primary" href="/services/{{ item.get('service', {}).get('key', '')|urlencode }}#update-confirmation"
+                     aria-label="Review update for {{ item.get('service', {}).get('name') or item.get('service', {}).get('key') }}">Review</a>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      {% else %}
+        <div class="empty-state is-positive">{{ icon('check') }}<p class="mb-0">No verified updates are currently available. Open a service to check its update information.</p></div>
+      {% endif %}
+    </section>
+
+    {% if undetermined %}
+      <section class="card updates-undetermined" aria-labelledby="updates-undetermined-title">
+        <div class="card-header">
+          <div>
+            <h2 class="card-title" id="updates-undetermined-title">Could not be checked</h2>
+            <p class="card-subtitle">UPT does not treat these as up to date. The recorded reason is shown for each.</p>
+          </div>
+        </div>
+        <div class="table-responsive">
+        <table class="table data-table undetermined-table">
+          <thead>
+            <tr>
+              <th scope="col">Service</th>
+              <th scope="col">State</th>
+              <th scope="col">Reason</th>
+              <th scope="col">Current</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for entry in undetermined %}
+              {% set item = entry.item %}
+              <tr>
+                <td class="cell-service">{{ service_cell(item) }}</td>
+                <td data-label="State"><span class="badge {{ item.get('status')|status_class }}">{{ item.get('status')|status_label }}</span></td>
+                <td data-label="Reason" class="cell-reason">{{ entry.identity.reason }}</td>
+                <td data-label="Current">{{ version_value(entry.identity.current) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      </section>
+    {% endif %}
+
+    {% if current %}
+      <details class="card disclosure-card updates-current">
+        <summary class="card-header">
+          <span class="card-title">Up to date or pinned <span class="badge status-neutral count-badge">{{ current|length }}</span></span>
+          {{ icon('chevron-down', 'disclosure-chevron') }}
+        </summary>
+        <div class="table-responsive">
+        <table class="table data-table current-table">
+          <thead>
+            <tr>
+              <th scope="col">Service</th>
+              <th scope="col">State</th>
+              <th scope="col">Current</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for entry in current %}
+              {% set item = entry.item %}
+              <tr>
+                <td class="cell-service">{{ service_cell(item) }}</td>
+                <td data-label="State"><span class="cell-value"><span class="badge {{ item.get('status')|status_class }}">{{ item.get('status')|status_label }}</span>{% if entry.identity.reason %}<span class="cell-note">{{ entry.identity.reason }}</span>{% endif %}</span></td>
+                <td data-label="Current">{{ version_value(entry.identity.current) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      </details>
+    {% endif %}
+    {% if groups['excluded'] %}
+      <details class="card disclosure-card updates-excluded">
+        <summary class="card-header">
+          <span class="card-title">Excluded from checks <span class="badge status-neutral count-badge">{{ groups['excluded']|length }}</span></span>
+          {{ icon('chevron-down', 'disclosure-chevron') }}
+        </summary>
+        <p class="card-subtitle">Ignored services and local builds are not checked against registries.</p>
+        <div class="table-responsive">
+          <table class="table data-table current-table">
+            <thead><tr><th scope="col">Service</th><th scope="col">State</th><th scope="col">Reason</th></tr></thead>
+            <tbody>
+              {% for entry in groups['excluded'] %}
+                {% set item = entry.item %}
+                <tr>
+                  <td class="cell-service">{{ service_cell(item) }}</td>
+                  <td data-label="State"><span class="badge {{ item.get('status')|status_class }}">{{ item.get('status')|status_label }}</span></td>
+                  <td data-label="Reason" class="cell-reason">{{ entry.identity.reason }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    {% endif %}
+  {% elif snapshot_available %}
+    <section class="card empty-state-card" role="status">
+      <div class="empty-state">
+        {{ icon('info') }}
+        <div>
+          <h2 class="empty-state-title">No update checks yet</h2>
+          <p class="mb-0">Open a service to check it individually, or run a read-only inventory scan.</p>
+        </div>
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}

@@ -1,0 +1,92 @@
+{% from "_ui.html" import icon, sprite %}
+<!doctype html>
+<html lang="en" data-theme="light" data-bs-theme="light">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
+    <title>{% block title %}UPT{% endblock %} · UPT</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='tabler.min.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+    <script src="{{ url_for('static', path='theme.js') }}"></script>
+  </head>
+  <body class="app-body" data-status-labels="{{ status_labels|tojson|forceescape }}">
+    {{ sprite() }}
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="app-shell">
+      <header class="app-navbar">
+        <div class="app-navbar-bar app-container">
+          <a class="app-brand" href="/" aria-label="UPT overview">
+            <span class="brand-mark" aria-hidden="true">U</span>
+            <span class="brand-name">UPT</span>
+            <span class="app-version">{{ version }}</span>
+          </a>
+          {% if session and session.user_id %}
+            <details class="account-menu">
+              <summary aria-label="Account menu for {{ session.username }}">
+                <span class="app-avatar" aria-hidden="true">{{ (session.username or '?')[:1]|upper }}</span>
+                <span class="app-nav-user" title="{{ session.username }}">{{ session.username }}</span>{{ icon('chevron-down') }}
+              </summary>
+              <div class="account-menu-panel">
+                <span class="account-menu-label">Signed in as <strong>{{ session.username }}</strong></span>
+                <a href="/settings">{{ icon('settings') }} Account &amp; settings</a>
+                <form method="post" action="/logout">
+                  <input type="hidden" name="csrf" value="{{ csrf }}">
+                  <button type="submit">{{ icon('signout') }} Sign out</button>
+                </form>
+              </div>
+            </details>
+          {% endif %}
+        </div>
+        {% if session and session.user_id %}
+          <nav class="app-navigation" id="primary-navigation" aria-label="Primary">
+            <div class="app-nav app-container">
+              {% for key, href, label, glyph in [
+                ('overview', '/', 'Overview', 'overview'),
+                ('services', '/services', 'Services', 'services'),
+                ('updates', '/updates', 'Updates', 'updates'),
+                ('history', '/history', 'History', 'history'),
+                ('settings', '/settings', 'Settings', 'settings')] %}
+                <a class="nav-link {% if active == key %}active{% endif %}" href="{{ href }}" {% if active == key %}aria-current="page"{% endif %}>{{ icon(glyph) }}<span>{{ label }}</span></a>
+              {% endfor %}
+            </div>
+          </nav>
+        {% endif %}
+      </header>
+      <div class="page-wrapper">
+        <header class="app-page-header">
+          <div class="app-container app-topbar{{ self.content_class() }}">
+            {% block page_breadcrumb %}{% endblock %}
+            <div class="app-page-header-layout">
+              <div class="app-page-header-main page-header-text">
+                <h1 class="page-title">{% block heading %}UPT{% endblock %}</h1>
+                {% block page_subtitle %}{% endblock %}
+                {% block page_header_context %}{% endblock %}
+              </div>
+              <div class="app-page-header-actions">{% block page_actions %}{% endblock %}</div>
+            </div>
+          </div>
+        </header>
+        <main id="main" class="page-body" tabindex="-1">
+          <div class="app-container app-content{% block content_class %}{% endblock %}">
+            {% block content %}{% endblock %}
+          </div>
+        </main>
+      </div>
+      {% if session and session.user_id %}
+        <nav class="mobile-destinations" aria-label="Mobile primary">
+          {% for key, href, label, glyph in [
+            ('overview', '/', 'Overview', 'overview'),
+            ('services', '/services', 'Services', 'services'),
+            ('updates', '/updates', 'Updates', 'updates'),
+            ('history', '/history', 'History', 'history')] %}
+            <a href="{{ href }}" {% if active == key %}aria-current="page"{% endif %}>{{ icon(glyph) }}<span>{{ label }}</span></a>
+          {% endfor %}
+        </nav>
+      {% endif %}
+    </div>
+    <script src="{{ url_for('static', path='htmx.min.js') }}" defer></script>
+    <script src="{{ url_for('static', path='app.js') }}" defer></script>
+    {% block page_scripts %}{% endblock %}
+  </body>
+</html>

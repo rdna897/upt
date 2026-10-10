@@ -1,0 +1,304 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # "edited" is only acted on when the base branch changed (see NOOP below).
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited]
+  schedule:
+    # Nightly full regression of main (schedules only run on the default branch).
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Owner-controlled private rehearsal/cutover setting; public repositories and
+  # fork PRs select hosted runners regardless of this value.
+  UPT_CI_HOSTED: ${{ vars.UPT_CI_HOSTED }}
+
+# NOOP: a PR "edited" event that did not change the base branch (title/body
+# edits). Such runs skip every job, never cancel the PR's real validation and
+# never publish a "merge-gate" check. The expression is repeated where needed
+# because job-level "if" cannot read workflow env:
+#   github.event.action == 'edited' && !github.event.changes.base
+# A newer commit/state/base change of the same PR cancels that PR's obsolete run
+# only. Every other run (NOOP edits, main push, nightly, manual) gets a unique
+# group and is never cancelled.
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ (github.event_name == 'pull_request'
+    && !(github.event.action == 'edited' && !github.event.changes.base))
+    && format('pr-{0}', github.event.pull_request.number)
+    || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && !(github.event.action == 'edited' && !github.event.changes.base) }}
+
+# Private same-repository CI keeps the Dockerless Debian runners until the owner
+# sets UPT_CI_HOSTED=true. Public/fork jobs use Ubuntu 24.04. This routing is not
+# an access-control boundary: revoke repository access to all private runners
+# before publication, because a PR can change its workflow. See docs/open-source.md.
+# Every worker checks its environment; all test execution requires the guard.
+# Draft PRs run targeted tests chosen by scripts/ci/select_tests.py; ready PRs,
+# main and nightly runs execute the complete suite. Only merge-gate attests full
+# validation; see docs/ci.md.
+jobs:
+  runner-smoke:
+    # Skipping smoke on NOOP edits skips plan and the test jobs via "needs".
+    if: ${{ !(github.event.action == 'edited' && !github.event.changes.base) }}
+    runs-on: >-
+      ${{ fromJSON(github.event.repository.private == true
+      && vars.UPT_CI_HOSTED != 'true'
+      && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository)
+      && '["self-hosted", "linux", "x64", "upt-ci"]'
+      || '["ubuntu-24.04"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Sanitise image-provided Docker client config (GitHub-hosted VMs only)
+        # The hosted image pre-provisions ~/.docker/config.json with a registry credential, which
+        # UPT forbids on test workers. The script removes it only if it has exactly the known
+        # shape and otherwise fails closed. The smoke check below is unchanged and still verifies.
+        if: runner.environment == 'github-hosted'
+        run: python3 scripts/ci/sanitise_hosted_docker_config.py
+      - name: Verify runner and test isolation prerequisites
+        run: python3 scripts/ci/runner_smoke.py --require-test-bootstrap
+
+  plan:
+    needs: runner-smoke
+    runs-on: >-
+      ${{ fromJSON(github.event.repository.private == true
+      && vars.UPT_CI_HOSTED != 'true'
+      && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository)
+      && '["self-hosted", "linux", "x64", "upt-ci"]'
+      || '["ubuntu-24.04"]') }}
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+      full: ${{ steps.select.outputs.full }}
+      run_unit: ${{ steps.select.outputs.run_unit }}
+      run_browser: ${{ steps.select.outputs.run_browser }}
+      python_versions: ${{ steps.select.outputs.python_versions }}
+      test_modules: ${{ steps.select.outputs.test_modules }}
+    defaults:
+      run:
+        working-directory: plan-checkout
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Full history so the PR head and base share a computable merge-base.
+          fetch-depth: 0
+          persist-credentials: false
+          # A private runner reuses its workspace between jobs, and the merge-gate sparse
+          # checkout leaves it a blobless partial clone. Base-side blobs are then missing and
+          # the credential-less diff below cannot lazily fetch them. A dedicated directory is
+          # created complete by this job and removed by the next job's `git clean -ffdx`.
+          path: plan-checkout
+      - name: Sanitise image-provided Docker client config (GitHub-hosted VMs only)
+        # The hosted image pre-provisions ~/.docker/config.json with a registry credential, which
+        # UPT forbids on test workers. The script removes it only if it has exactly the known
+        # shape and otherwise fails closed. The smoke check below is unchanged and still verifies.
+        if: runner.environment == 'github-hosted'
+        run: python3 scripts/ci/sanitise_hosted_docker_config.py
+      - name: Verify this worker
+        run: python3 scripts/ci/runner_smoke.py
+      - name: Select tests
+        id: select
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          args=(--event "$EVENT${ACTION:+/$ACTION}" --tested-sha "$GITHUB_SHA")
+          if [ "$EVENT" = pull_request ]; then
+            # A base-branch edit re-plans against the new base (base.sha below).
+            args+=(--base-ref "$BASE_REF")
+            args+=(--base "$BASE_SHA" --head "$HEAD_SHA")
+            if [ "$DRAFT" != true ]; then
+              args+=(--force-full "pull request is ready for review: merge validation")
+            fi
+          else
+            args+=(--force-full "$EVENT run: full regression")
+          fi
+          python3 scripts/ci/select_tests.py "${args[@]}"
+      - name: Lightweight change validation
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git diff --check "$(git merge-base "$BASE_SHA" "$HEAD_SHA")" "$HEAD_SHA"
+
+  unit-tests:
+    needs: plan
+    if: needs.plan.outputs.run_unit == 'true'
+    runs-on: >-
+      ${{ fromJSON(github.event.repository.private == true
+      && vars.UPT_CI_HOSTED != 'true'
+      && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository)
+      && '["self-hosted", "linux", "x64", "upt-ci"]'
+      || '["ubuntu-24.04"]') }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(needs.plan.outputs.python_versions) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Sanitise image-provided Docker client config (GitHub-hosted VMs only)
+        # The hosted image pre-provisions ~/.docker/config.json with a registry credential, which
+        # UPT forbids on test workers. The script removes it only if it has exactly the known
+        # shape and otherwise fails closed. The smoke check below is unchanged and still verifies.
+        if: runner.environment == 'github-hosted'
+        run: python3 scripts/ci/sanitise_hosted_docker_config.py
+      - name: Verify this test worker
+        run: python3 scripts/ci/runner_smoke.py --require-test-bootstrap
+      # uv provisions each exact Python version without modifying system Python.
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: false
+      - name: Create isolated Python environment
+        shell: bash
+        run: |
+          uv python install "${{ matrix.python-version }}"
+          uv venv --python "${{ matrix.python-version }}" .venv
+          uv pip install --python .venv/bin/python '.[test]'
+      - name: Run unit tests
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          FULL: ${{ needs.plan.outputs.full }}
+          TEST_MODULES: ${{ needs.plan.outputs.test_modules }}
+        run: |
+          set -euo pipefail
+          if [ "$FULL" = true ]; then
+            .venv/bin/python scripts/run_tests.py discover -s tests -v
+          else
+            # Same import root as discover -s tests; module names come from the
+            # selector's fixed map, never from PR-controlled text.
+            read -ra modules <<< "$TEST_MODULES"
+            test "${#modules[@]}" -gt 0
+            PYTHONPATH=tests .venv/bin/python scripts/run_tests.py -v "${modules[@]}"
+          fi
+      - name: Verify CLI entry point
+        run: .venv/bin/upt --version && .venv/bin/upt --help >/dev/null
+      - name: Verify package metadata equals runtime version
+        shell: bash
+        run: |
+          meta="$(.venv/bin/python -c 'import importlib.metadata as m; print(m.version("docker-update-manager"))')"
+          test "$(.venv/bin/upt --version)" = "upt $meta"
+
+  browser-tests:
+    needs: plan
+    if: needs.plan.outputs.run_browser == 'true'
+    runs-on: >-
+      ${{ fromJSON(github.event.repository.private == true
+      && vars.UPT_CI_HOSTED != 'true'
+      && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository)
+      && '["self-hosted", "linux", "x64", "upt-ci"]'
+      || '["ubuntu-24.04"]') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Sanitise image-provided Docker client config (GitHub-hosted VMs only)
+        # The hosted image pre-provisions ~/.docker/config.json with a registry credential, which
+        # UPT forbids on test workers. The script removes it only if it has exactly the known
+        # shape and otherwise fails closed. The smoke check below is unchanged and still verifies.
+        if: runner.environment == 'github-hosted'
+        run: python3 scripts/ci/sanitise_hosted_docker_config.py
+      - name: Verify this test worker
+        run: python3 scripts/ci/runner_smoke.py --require-test-bootstrap
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: false
+      - name: Create isolated browser test environment
+        shell: bash
+        run: |
+          uv python install 3.13
+          uv venv --python 3.13 .venv
+          uv pip install --python .venv/bin/python '.[test,browser-test]'
+      - name: Install Chromium
+        # Hosted VMs need system dependencies. Private LXC dependencies remain
+        # preinstalled; this workflow never runs apt on a private runner.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
+            .venv/bin/python -m playwright install --with-deps chromium
+          else
+            .venv/bin/python -m playwright install chromium
+          fi
+      - name: Run responsive browser suite
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          # runner.temp is permitted at step scope, and each runner has a
+          # private writable temp directory on either runner environment.
+          UPT_SCREENSHOT_DIR: ${{ runner.temp }}/upt-browser-screenshots-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python scripts/run_tests.py discover -s tests -p 'test_web_browser.py' -v
+
+  # The single required merge check. It always runs (GitHub reports a skipped
+  # required job as success) and passes only when this run executed and passed
+  # the complete suite, so targeted and docs-only runs leave it failed. On NOOP
+  # edits it is skipped under a different check name so that a skipped check
+  # can never stand in for "merge-gate".
+  merge-gate:
+    name: ${{ (github.event.action == 'edited' && !github.event.changes.base) && 'merge-gate-skipped (PR metadata edit)' || 'merge-gate' }}
+    needs: [runner-smoke, plan, unit-tests, browser-tests]
+    if: ${{ always() && !(github.event.action == 'edited' && !github.event.changes.base) }}
+    runs-on: >-
+      ${{ fromJSON(github.event.repository.private == true
+      && vars.UPT_CI_HOSTED != 'true'
+      && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository)
+      && '["self-hosted", "linux", "x64", "upt-ci"]'
+      || '["ubuntu-24.04"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read  # job timings for the run summary only
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+      - name: Sanitise image-provided Docker client config (GitHub-hosted VMs only)
+        # The hosted image pre-provisions ~/.docker/config.json with a registry credential, which
+        # UPT forbids on test workers. The script removes it only if it has exactly the known
+        # shape and otherwise fails closed. The smoke check below is unchanged and still verifies.
+        if: runner.environment == 'github-hosted'
+        run: python3 scripts/ci/sanitise_hosted_docker_config.py
+      - name: Verify this worker
+        run: python3 scripts/ci/runner_smoke.py
+      - name: Enforce full validation and summarise run
+        shell: bash
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          PLAN_MODE: ${{ needs.plan.outputs.mode }}
+          PLAN_FULL: ${{ needs.plan.outputs.full }}
+          PLAN_PYTHON_VERSIONS: ${{ needs.plan.outputs.python_versions }}
+          PLAN_TEST_MODULES: ${{ needs.plan.outputs.test_modules }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/merge_gate.py

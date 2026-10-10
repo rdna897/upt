@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% from "_ui.html" import icon, freshness_meta, runtime_state, version_value %}
+{% block title %}Services{% endblock %}
+{% block heading %}Services{% endblock %}
+{% block page_header_context %}
+  <p class="page-meta">{{ freshness_meta(runtime, snapshot, scan, snapshot_trustworthy) }}</p>
+{% endblock %}
+{% block content %}
+  {% if not snapshot_available %}
+    <div class="alert alert-danger" role="alert">{{ icon('alert') }}<div>
+      <strong>Service inventory unavailable.</strong>
+      The UPT agent could not return the cached snapshot. This is not an empty inventory.
+    </div></div>
+  {% endif %}
+  {% if runtime.get('status') in ['unavailable', 'stale'] %}
+    <div class="alert alert-warning runtime-unavailable" role="status">{{ icon('alert') }}<div>
+      <strong>{% if runtime.get('status') == 'unavailable' %}{{ runtime|runtime_failure_message }}.{% else %}Runtime snapshot is stale.{% endif %}</strong>
+      {% if runtime.get('last_success_at') %}Rows with runtime values show last-known state from <time data-local-time datetime="{{ runtime.get('last_success_at')|utc_timestamp }}" title="{{ runtime.get('last_success_at')|utc_timestamp }}">{{ runtime.get('last_success_at')|relative_time }}</time>.{% else %}No successful runtime snapshot is available yet.{% endif %}
+    </div></div>
+  {% endif %}
+
+  <form class="service-filters service-filters-desktop toolbar" method="get" role="search" aria-label="Filter services">
+    <label class="filter-search">
+      <span class="visually-hidden">Search services</span>
+      {{ icon('search', 'input-icon') }}
+      <input class="form-control" name="q" value="{{ q }}"
+             placeholder="Search name, image, or stack" type="search">
+    </label>
+    <label>
+      <span class="visually-hidden">Stack</span>
+      <select class="form-select" name="stack">
+        <option value="">All stacks</option>
+        {% for value in stacks %}
+          <option value="{{ value }}" {% if value == stack %}selected{% endif %}>{{ value }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span class="visually-hidden">Status</span>
+      <select class="form-select" name="status">
+        <option value="">All statuses</option>
+        {% for value in statuses %}
+          <option value="{{ value }}" {% if value == status %}selected{% endif %}>{{ value|status_label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button class="btn btn-outline-secondary" type="submit">Filter</button>
+    {% if q or stack or status %}<a class="btn btn-ghost" href="/services">Clear</a>{% endif %}
+    <span class="toolbar-count" role="status">{{ items|length }} {{ 'service' if items|length == 1 else 'services' }}</span>
+  </form>
+
+  <form class="service-filters service-filters-mobile" method="get" role="search" aria-label="Filter services">
+    <label class="filter-search">
+      <span class="visually-hidden">Search services</span>
+      {{ icon('search', 'input-icon') }}
+      <input class="form-control" name="q" value="{{ q }}"
+             placeholder="Search services" type="search">
+    </label>
+    <button class="btn btn-outline-secondary mobile-search-submit" type="submit" aria-label="Search">{{ icon('search') }}</button>
+    {% set active_filter_count = (1 if stack else 0) + (1 if status else 0) %}
+    <details class="filter-disclosure">
+      <summary class="btn btn-outline-secondary">
+        <span>Filters</span>
+        {% if active_filter_count %}<span class="badge status-info filter-active-count" aria-label="{{ active_filter_count }} active filters">{{ active_filter_count }}</span>{% endif %}
+      </summary>
+      <div class="service-filter-panel">
+        <label>
+          <span class="form-label">Stack</span>
+          <select class="form-select" name="stack">
+            <option value="">All stacks</option>
+            {% for value in stacks %}
+              <option value="{{ value }}" {% if value == stack %}selected{% endif %}>{{ value }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          <span class="form-label">Status</span>
+          <select class="form-select" name="status">
+            <option value="">All statuses</option>
+            {% for value in statuses %}
+              <option value="{{ value }}" {% if value == status %}selected{% endif %}>{{ value|status_label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="service-filter-actions">
+          <button class="btn btn-primary" type="submit">Apply filters</button>
+          {% if q or stack or status %}<a class="btn btn-ghost" href="/services">Clear</a>{% endif %}
+        </div>
+      </div>
+    </details>
+  </form>
+
+  {% if items and inventory_available %}
+    <section class="card service-table-wrap" aria-label="Service inventory">
+      <div class="table-responsive">
+        <table class="table data-table service-table">
+          <thead>
+            <tr>
+              <th scope="col">Service</th>
+              <th scope="col">Runtime</th>
+              <th scope="col">Version</th>
+              <th scope="col">Update status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in items %}
+              {% set service = item.get('service', {}) %}
+              {% set identity = update_identity(item) %}
+              <tr>
+                <td class="cell-service">
+                  <a class="cell-title" href="/services/{{ service.get('key', '')|urlencode }}">{{ service.get('name') or service.get('key', 'Unknown') }}</a>
+                  <span class="cell-sub">{{ service.get('stack') or 'Standalone' }}{% if display_repository(service.get('image')) %} · <code class="service-repository" title="{{ service.get('image') }}">{{ display_repository(service.get('image')) }}</code>{% endif %}</span>
+                </td>
+                <td class="service-runtime-cell">{{ runtime_state(item.get('runtime'), item.get('runtime_stale'), item.get('runtime_missing')) }}</td>
+                <td class="service-version-cell" title="{{ inventory_identity(item) }}">
+                  {{ version_value(identity.current) }}
+                  {% if identity.available %}<span class="version-next">{{ icon('arrow-right') }}<span class="visually-hidden">available:</span>{{ version_value(identity.available) }}</span>{% endif %}
+                </td>
+                <td class="service-maintenance-cell">
+                  <span class="badge {{ item.get('status')|status_class }}">{{ item.get('status')|status_label }}</span>
+                  {% if service.get('ignored') %}<small class="cell-note">Excluded from updates</small>{% endif %}
+                  {% if item.get('status') == 'UNTRACKED DIGEST' %}
+                    <small class="cell-note status-warning-note">No trusted tracking channel recorded.</small>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <ul class="service-card-list" aria-label="Services" role="list">
+      {% for item in items %}
+        {% set service = item.get('service', {}) %}
+        {% set status = item.get('status', 'UNKNOWN') %}
+        <li>
+        <a class="card service-card{% if item.get('error') %} service-card-with-warning{% endif %}"
+           href="/services/{{ service.get('key', '')|urlencode }}">
+          <span class="service-card-heading">
+            <span class="service-card-name">{{ service.get('name') or service.get('key', 'Unknown service') }}</span>
+            <span class="badge {{ status|status_class }}">{{ status|status_label }}</span>
+          </span>
+          <span class="service-card-version">
+            <span class="service-card-meta-label visually-hidden">Image identity</span>
+            {{ inventory_identity(item) }}
+          </span>
+          <span class="service-card-meta">
+            <span class="service-card-stack"><span class="service-card-meta-label visually-hidden">Stack</span>{{ service.get('stack') or 'Standalone' }}</span>
+            <span class="service-card-runtime">
+              <span class="service-card-meta-label visually-hidden">Runtime</span>
+              {{ runtime_state(item.get('runtime'), item.get('runtime_stale'), item.get('runtime_missing')) }}
+            </span>
+          </span>
+          {% if service.get('ignored') %}<span class="service-card-warning">Excluded from update checks</span>{% endif %}
+          {% if item.get('error') %}<span class="service-card-warning">{{ item.get('error') }}</span>{% endif %}
+          <span class="service-card-link" aria-hidden="true">{{ icon('chevron-right') }}</span>
+        </a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% elif snapshot_available and (snapshot_trustworthy or inventory_available) %}
+    <section class="card empty-state-card" role="status">
+      <div class="empty-state">
+        {{ icon('search') }}
+        <div>
+          <h2 class="empty-state-title">No services found</h2>
+          <p class="mb-0">
+            {% if q or stack or status %}
+              No services match these filters. <a href="/services">Clear filters</a>
+            {% else %}
+              No containers were found in the latest runtime snapshot or update scan.
+            {% endif %}
+          </p>
+        </div>
+      </div>
+    </section>
+  {% elif snapshot_available and not runtime.get('containers') %}
+    <section class="card empty-state-card" role="status">
+      <div class="empty-state">
+        {{ icon('info') }}
+        <div>
+          <h2 class="empty-state-title">No complete service snapshot yet</h2>
+          <p class="mb-0">A partial or failed scan attempt is not presented as a complete inventory.</p>
+        </div>
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}
