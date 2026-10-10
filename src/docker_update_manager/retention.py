@@ -9,6 +9,13 @@ from .system import run, CommandError
 
 MANAGED_DIRS=("backups","conversion-file-backups","conversion-snapshots","restore-bundles","tmp","compose-recoveries")
 TERMINAL_PURGE_STATUSES={"PURGED","ALREADY ABSENT"}
+# Only unambiguous legacy history identities confer rollback eligibility.
+_LEGACY_REF_CANDIDATES=(
+    "SELECT p.history_id,p.image_id,p.created FROM protected_images p "
+    "WHERE p.history_id IS NOT NULL "
+    "AND NOT EXISTS (SELECT 1 FROM rollback_refs r WHERE r.history_id=p.history_id) "
+    "AND (SELECT COUNT(*) FROM protected_images other WHERE other.history_id=p.history_id)=1"
+)
 
 def _utc(value=None):
     if value is None: return datetime.now(timezone.utc)
@@ -90,8 +97,7 @@ def _cleanup_compose_artifact(state, path, days, now, dry_run):
 def _migrate_refs(state):
     if not state.db_path.exists(): return
     with state.connect() as c:
-        rows=c.execute("SELECT p.history_id,p.image_id,p.created FROM protected_images p LEFT JOIN rollback_refs r ON r.history_id=p.history_id WHERE r.history_id IS NULL").fetchall()
-        for history_id,image_id,created in rows: c.execute("INSERT OR IGNORE INTO rollback_refs(history_id,image_id,created) VALUES(?,?,?)",(history_id,image_id,created))
+        c.execute("INSERT OR IGNORE INTO rollback_refs(history_id,image_id,created) " + _LEGACY_REF_CANDIDATES)
 
 def _docker_image_accounting():
     """Return Docker's own per-image logical and unique-size accounting."""
@@ -118,17 +124,16 @@ def _image_info(accounting,image_id):
 def rollback_points(cfg,state,now=None,image_details=False):
     if not state.db_path.exists(): return []
     days=_settings(cfg)["rollback_images_days"]; now=_utc(now)
-    # Legacy protected_images rows without a rollback_refs entry previously
-    # caused a write during inventory (_migrate_refs). Project the same rows
-    # without mutating state; the real cleanup path still materialises them.
+    # Project exactly the candidates used by _migrate_refs without mutating
+    # state; NULL or ambiguous history identities remain protected separately.
     with state.read() as c:
         c.row_factory=sqlite3.Row
         rows=c.execute(
             "SELECT r.*,h.stack,h.service,h.old_image,h.old_version,h.old_digest,h.result "
             "FROM (SELECT history_id,image_id,created,expired,purge_status FROM rollback_refs "
             "UNION ALL "
-            "SELECT p.history_id,p.image_id,p.created,0,NULL FROM protected_images p "
-            "WHERE NOT EXISTS (SELECT 1 FROM rollback_refs existing WHERE existing.history_id=p.history_id)"
+            "SELECT legacy.history_id,legacy.image_id,legacy.created,0,NULL FROM (" +
+            _LEGACY_REF_CANDIDATES + ") legacy"
             ") r LEFT JOIN history h ON h.id=r.history_id ORDER BY r.created DESC"
         ).fetchall()
     # Docker may take up to 120 seconds. Neither a write reservation nor a
@@ -287,7 +292,13 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
             before=c.total_changes
             c.execute("DELETE FROM disk_snapshots WHERE timestamp<?",(disk_cutoff,))
             c.execute("DELETE FROM rollback_refs WHERE expired=1 AND purge_status IN ('PURGED','ALREADY ABSENT') AND created<?",(resolved_cutoff,))
-            c.execute("DELETE FROM protected_images WHERE image_id NOT IN (SELECT image_id FROM rollback_refs WHERE expired=0)")
+            c.execute(
+                "DELETE FROM protected_images WHERE EXISTS ("
+                "SELECT 1 FROM rollback_refs r WHERE r.history_id=protected_images.history_id "
+                "AND r.image_id=protected_images.image_id) AND NOT EXISTS ("
+                "SELECT 1 FROM rollback_refs active WHERE active.image_id=protected_images.image_id "
+                "AND active.expired=0)"
+            )
             c.execute("DELETE FROM history WHERE timestamp<? AND id NOT IN (SELECT history_id FROM rollback_refs)",(audit_cutoff,))
             c.execute("PRAGMA optimize")
             result["database"]["rows_pruned"]=c.total_changes-before

@@ -20,19 +20,35 @@ write-transaction attempt from read-only inventory.
 1. `rollback_points` uses `state.read()` for exactly one rollback-point
    SELECT, fetches the complete row snapshot, and closes the read transaction
    before starting Docker accounting or computing/enriching its report.
-2. The SELECT projects both persisted `rollback_refs` and missing legacy
-   `protected_images` rows (by `history_id`, using `UNION ALL` and
-   `NOT EXISTS`). Its columns, ordering, history joins and default
-   `expired=0`/`purge_status=NULL` match the former result of
-   `_migrate_refs`, without persisting any new reference.
+2. The SELECT projects persisted `rollback_refs` plus legacy migration
+   candidates via `UNION ALL`. One module-level SQL selection is shared by
+   projection and `_migrate_refs` (`INSERT OR IGNORE ... SELECT`): a candidate
+   has a non-NULL `history_id`, no existing ref with that ID, and is the only
+   protected row with that ID. Columns, ordering, history joins and defaults
+   (`expired=0`/`purge_status=NULL`) match materialisation without writing.
+   Unique orphaned IDs still qualify, with NULL stack/service from the join.
 3. The actual, non-dry-run `cleanup` path retains its existing
    `_migrate_refs` call to materialise legacy references before applying
-   retention rules. Cleanup's protected-image, shared-reference and
+   retention rules. The final protection prune requires a ref matching both
+   `history_id` and `image_id`, and no active ref for the image. The per-image
+   delete after successful/absent image removal, shared-reference checks and
    terminal-status checks remain unchanged. Dry runs never materialise refs.
 4. `State.connect`, `State.read`, schema identity, busy timeout, WAL
    configuration and all other database owners remain unchanged.
    Lazy, one-time `State` schema checking is an existing independent
    initialisation contract; this change does not redesign it.
+
+## Legacy compatibility correction
+
+Previously, NULL-history protections acquired fabricated SQLite row IDs on
+repeated migration, making manual-recovery images eligible for expiry and
+removal. Shared-history rows projected as multiple points although migration
+kept only one; the final prune could silently drop the others' protection.
+NULL and ambiguous legacy rows now remain protected, are neither migrated nor
+projected as rollback points, and require explicit handling. `--all` does not
+invent eligibility for them. Non-migrated rows without their own matching ref
+also survive the final prune. Normal expiry (including expired-but-in-use
+protection pruning), shared-image protection and purge idempotence are retained.
 
 ## Synthetic regression evidence
 
@@ -47,6 +63,11 @@ write-transaction attempt from read-only inventory.
   or inserting a reference.
 - Non-dry-run cleanup materialising that legacy ref while preserving the
   projected rollback status, expiry, scope and active protection.
+- Normal, duplicate, NULL-history and unique orphaned legacy fixtures checking
+  unchanged database bytes/rows during inventory, projection/materialisation
+  equality, dry-run/real cleanup selection, repeated cleanup, and protected
+  legacy images excluded from removal even with `--all`.
+- Matching history/image prune boundaries and normal expired-but-in-use behavior.
 - An injected accounting exception followed by a successful separate writer,
   guarding transaction release even on exceptions.
 
