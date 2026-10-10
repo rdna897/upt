@@ -2,6 +2,7 @@
 import _upt_isolation  # noqa: F401 - must stay first; see scripts/run_tests.py
 import json
 import os
+import sqlite3
 import stat
 import threading
 import time
@@ -21,6 +22,7 @@ from docker_update_manager.webapp import operation_event_role
 from docker_update_manager.webservice import AgentServer, ReadOnlyService, _public_service
 
 from progress_assertions import assert_stage_model
+from sqlite_faults import history_insert, sqlite_fault
 from test_compose_reconciliation import (BASE_COMPOSE, SECRET, ComposeFixture, FakeCompose, service_hash,
                                          use_named_runtime_network, with_named_network)
 import test_compose_reconciliation as phase1_fixtures
@@ -752,6 +754,29 @@ class ComposeApplyTests(ComposeFixture):
         self.assertNotIn("history_id", operation["result"])
         self.assertEqual(assert_stage_model(self, operation["events"], 8), list(range(1, 8)))
         self.assertEqual(self.state.history(), [])
+
+    def test_current_behaviour_unavailable_database_cannot_surface_the_history_warning(self):
+        # S6-R3 (G2, issue #9) CURRENT-BEHAVIOUR characterisation: the retry and
+        # factual-success policy above is the only one in place, but its warning
+        # is itself a SQLite write. Here the database becomes unavailable at the
+        # first History insert and stays unavailable.
+        result, payload, intent = self.start()
+        with sqlite_fault(self.state, history_insert(action="compose_reconcile"), mode="unavailable") as fault, \
+                patch("docker_update_manager.webservice.time.sleep"), \
+                self.assertLogs("docker_update_manager.webservice", "ERROR"), \
+                self.assertRaisesRegex(sqlite3.OperationalError, "unable to open database file"):
+            # The terminal write fails, the worker's fallback repeats the whole
+            # finalisation once, and that failure escapes the worker thread.
+            self.agent._compose_worker(result["operation_id"], payload, intent)
+        self.assertEqual(len(fault.hits), 1)
+        self.assertEqual(len(self.fake.up_calls), 1)  # applied once; never reversed
+        self.assertEqual(self.compose.read_bytes(), self.desired)
+        self.assertEqual(self.state.history(), [])
+        operation = self.agent.operation_status({"operation_id": result["operation_id"], "after_event_id": 0})
+        # No durable History row, warning or terminal state: the operation is
+        # left running although the workload change is complete.
+        self.assertEqual(operation["status"], "running")
+        self.assertNotIn("warnings", operation.get("result") or {})
 
     def test_changed_bind_configuration_recovers_old_mount_then_restores_pending_source(self):
         self.edit("source: /srv/private/sonarr", "source: /srv/private/sonarr-new")
