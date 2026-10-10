@@ -1,0 +1,67 @@
+# S6-R10 — SQLite writer contention during retention inventory
+
+**Tracking:** [issue #11](https://github.com/rdna897/upt/issues/11) (G5, Stage 6a).
+**Base:** public `main` at `c0e8365a376897800f7bf350c3129efac6945766`.
+**Scope:** `src/docker_update_manager/retention.py` and regression tests.
+**Production deployment freeze:** remains in force. This change is not deployment or merge approval.
+
+## Existing failure
+
+`upt retention` calls `inventory(image_details=True)` without holding
+`update.lock`. `rollback_points` entered `state.connect()`, which takes
+`BEGIN IMMEDIATE`, and then invoked Docker `system df` (120-second timeout)
+while retaining SQLite's single writer slot. A competing history writer could
+time out after its 30-second SQLite busy timeout, creating the S6-R1/R1b
+publication-failure trigger. `_migrate_refs` also performed an unconditional
+write-transaction attempt from read-only inventory.
+
+## Accepted local correction
+
+1. `rollback_points` uses `state.read()` for exactly one rollback-point
+   SELECT, fetches the complete row snapshot, and closes the read transaction
+   before starting Docker accounting or computing/enriching its report.
+2. The SELECT projects both persisted `rollback_refs` and missing legacy
+   `protected_images` rows (by `history_id`, using `UNION ALL` and
+   `NOT EXISTS`). Its columns, ordering, history joins and default
+   `expired=0`/`purge_status=NULL` match the former result of
+   `_migrate_refs`, without persisting any new reference.
+3. The actual, non-dry-run `cleanup` path retains its existing
+   `_migrate_refs` call to materialise legacy references before applying
+   retention rules. Cleanup's protected-image, shared-reference and
+   terminal-status checks remain unchanged. Dry runs never materialise refs.
+4. `State.connect`, `State.read`, schema identity, busy timeout, WAL
+   configuration and all other database owners remain unchanged.
+   Lazy, one-time `State` schema checking is an existing independent
+   initialisation contract; this change does not redesign it.
+
+## Synthetic regression evidence
+
+`tests/test_retention_writer_contention.py` includes:
+
+- A blocked Docker accounting call, controlled by `threading.Event`, while a
+  separate `State` instance must commit a history write **before**
+  accounting is released. The inventory result remains the earlier snapshot.
+  All test threads have bounded waits and `finally` cleanup.
+- A legacy protection reference missing `rollback_refs`, proving that plain
+  inventory and retention dry-run expose it without calling `state.connect`
+  or inserting a reference.
+- Non-dry-run cleanup materialising that legacy ref while preserving the
+  projected rollback status, expiry, scope and active protection.
+- An injected accounting exception followed by a successful separate writer,
+  guarding transaction release even on exceptions.
+
+Every fixture uses a temporary database and mocked Docker accounting. No live
+Docker or production SQLite database is accessed.
+
+## Non-goals and gate
+
+Not included: G2 completion-policy corrections, Stage 4/5 designs or
+implementation, recovery-bundle filesystem/receipt ordering, R12, schema
+migrations, web or agent interfaces, and operational changes.
+
+Run the repository's guarded test harness first, then full exact-head CI
+(Python 3.10, Python 3.13, Chromium and merge gate). An independent reviewer
+must inspect the final exact-head diff for races, stale inventory implications,
+legacy-reference semantics, rollback protection and disclosure risk. Record
+their findings and re-run CI after any changes. Leave the PR unmerged pending
+explicit owner approval. Do not deploy.
