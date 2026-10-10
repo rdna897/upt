@@ -16,6 +16,7 @@ from docker_update_manager.lock import Lock
 from docker_update_manager.operations import ReviewedTargetChanged, WebRollbackFailure, do_web_rollback
 from docker_update_manager.progress import NULL_REPORTER, Reporter
 from progress_assertions import assert_core_stage_model
+from sqlite_faults import history_insert, sqlite_fault, terminal_operation_update
 from docker_update_manager.state import State
 from docker_update_manager.system import CommandError
 from docker_update_manager.webservice import ReadOnlyService, _public_result, _public_service
@@ -396,6 +397,78 @@ class WebRollbackReviewTests(unittest.TestCase):
                             for command in commands if "up" in command))
         audits=self.state.audit_events(10)
         self.assertIn(("web_rollback","success"),{(event["action"],event["result"]) for event in audits})
+
+    # S6-R1b (G2, issue #9): CURRENT-BEHAVIOUR characterisation, not the desired
+    # contract. A healthy web rollback is followed by a SQLite failure inside a
+    # real State transaction; the approved G2 fixes are expected to break these.
+    def run_rollback_with_sqlite_fault(self,match,**fault):
+        commands=[]
+        def operation_run(args,**kwargs):
+            commands.append(list(args))
+            if "image" in args and "inspect" in args:
+                return "sha256:"+"1"*64
+            return ""
+        with patch("docker_update_manager.webservice.discover",return_value=[self.service]),\
+             patch("docker_update_manager.webservice.run",side_effect=self.inspect_run),\
+             patch("docker_update_manager.operations.discover",return_value=[
+                 self.make_service(image_id="sha256:"+"1"*64)]),\
+             patch("docker_update_manager.operations.run",side_effect=operation_run),\
+             patch("docker_update_manager.compose.run",return_value=""):
+            reviewed=self.review()
+            with sqlite_fault(self.state,match,**fault) as injected:
+                started=self.agent.start_rollback({"confirmation_id":reviewed["confirmation_id"],
+                    "requested_by":"admin","client_ip":"127.0.0.1","user_agent":"tests"})
+                with self.agent._lock:
+                    worker=self.agent._operation_threads.get(started["operation_id"])
+                # A missing worker has already finished: it is removed only in
+                # the worker's own finally block.
+                if worker is not None: worker.join(10)
+                self.assertFalse(worker is not None and worker.is_alive())
+        self.assertEqual(len(injected.hits),1)
+        # Docker outcome in every case: exactly one service-scoped rollback
+        # recreation and no recovery recreation.
+        self.assertEqual(sum("up" in command for command in commands),1)
+        rollbacks=[item for item in self.state.history() if item["action"]=="rollback"]
+        return self.state.operation_status(started["operation_id"]),rollbacks
+
+    def test_current_behaviour_completed_rollback_with_failed_history_write_is_recorded_as_no_changes_made(self):
+        with self.assertLogs("docker_update_manager.webservice","ERROR"):
+            operation,rollbacks=self.run_rollback_with_sqlite_fault(
+                history_insert(action="rollback",result="ROLLED BACK"))
+        # DEFECT encoded as current behaviour: sqlite3.Error is outside
+        # do_web_rollback's recovery handler, so the web wrapper's stale-review
+        # fallback records the completed rollback as if nothing had changed.
+        self.assertEqual(operation["status"],"failed")
+        self.assertEqual(operation["result"],{"manual_recovery_required":False,"recovered":False})
+        (rollback,)=rollbacks
+        self.assertEqual((rollback["result"],rollback["rollback_result"]),("FAILED","NO CHANGES MADE"))
+        self.assertEqual(json.loads(rollback["details"])["error"],"review became stale before mutation")
+        self.assertIsNone(rollback["backup"])
+        self.assertIn(("web_rollback","failed"),
+                      {(event["action"],event["result"]) for event in self.state.audit_events(10)})
+
+    def test_current_behaviour_failed_success_terminal_write_leaves_history_and_operation_disagreeing(self):
+        with self.assertLogs("docker_update_manager.webservice","ERROR"):
+            operation,rollbacks=self.run_rollback_with_sqlite_fault(terminal_operation_update("succeeded"))
+        (rollback,)=rollbacks
+        self.assertEqual((rollback["result"],rollback["rollback_result"]),("ROLLED BACK","SUCCESS"))
+        self.assertTrue(Path(rollback["backup"]).is_dir())
+        # The fallback finds this operation's rollback row and adds no FAILED row,
+        # but still finishes the operation as failed.
+        self.assertEqual(operation["status"],"failed")
+        self.assertIn(("web_rollback","success"),
+                      {(event["action"],event["result"]) for event in self.state.audit_events(10)})
+
+    def test_current_behaviour_persistent_unavailability_after_rollback_leaves_no_terminal_state(self):
+        with self.assertLogs("docker_update_manager.webservice","ERROR"),\
+             self.assertLogs("docker_update_manager.reconciliation","WARNING"):
+            operation,rollbacks=self.run_rollback_with_sqlite_fault(
+                history_insert(action="rollback",result="ROLLED BACK"),mode="unavailable")
+        # Nothing about the completed rollback is durable and the operation is
+        # never finished: it stays running after its worker has exited. A fix
+        # that keeps evidence outside SQLite must also update this test.
+        self.assertEqual(rollbacks,[])
+        self.assertEqual(operation["status"],"running")
 
     def test_agent_recovery_reconstructs_model_from_existing_verified_backup_paths(self):
         env_path=self.root/".env"
