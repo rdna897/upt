@@ -2,8 +2,14 @@
 
 import _upt_isolation  # noqa: F401 - must stay first; see scripts/run_tests.py
 import json
+import logging
+import socket
+import sqlite3
 import tempfile
+import threading
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
 from unittest import mock
@@ -19,7 +25,7 @@ from docker_update_manager.runtime import (
 )
 from docker_update_manager.state import State
 from docker_update_manager.system import CommandError
-from docker_update_manager.webservice import READ_ONLY_OPERATIONS, ReadOnlyService
+from docker_update_manager.webservice import READ_ONLY_OPERATIONS, AgentServer, ReadOnlyService
 from docker_update_manager.release_identity import inventory_identity
 from docker_update_manager.webviews import attention_items, merge_service_items, runtime_attention, runtime_summary
 
@@ -732,6 +738,326 @@ class RuntimeAgentBoundaryTests(unittest.TestCase):
             output = "\n".join(captured.output)
             self.assertIn("Runtime snapshot persistence failed stage=persist failure_class=OSError", output)
             self.assertNotIn("/private", output)
+
+
+MONITOR_THREAD = "upt-runtime-health"
+DOCKER_VERSION_ARGV = ["docker", "version", "--format", "{{.Server.Version}}"]
+
+
+class _StopServing(Exception):
+    """Ends the agent accept loop deterministically in wiring tests."""
+
+
+class RuntimeMonitorLifecycleTests(unittest.TestCase):
+    """Phase 3 regressions for the agent-owned runtime monitor (no Docker, no network).
+
+    Fail-closed guards stay patched until every monitor thread a test started has
+    been released and joined: cleanups run LIFO, so ``_stop_monitors`` (registered
+    last) runs before the guards and the temporary state directory are removed.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.state = State(self.root / "state")
+        self.service = ReadOnlyService(Config(path=str(self.root / "missing.yml")), self.state)
+        self.release = Event()
+        self.guards = {}
+        for name, target in (("docker", "docker_update_manager.system.run"),
+                             ("run", "subprocess.run"), ("popen", "subprocess.Popen"),
+                             ("network", "urllib.request.urlopen")):
+            patcher = mock.patch(target, side_effect=AssertionError("live " + name + " call in test"))
+            self.guards[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+        self.monitors = []
+        self.addCleanup(self._stop_monitors)
+
+    def _stop_monitors(self):
+        self.release.set()
+        self.service.stop_health_monitor()
+        for thread in {*self.monitors, self.service._health_thread} - {None}:
+            thread.join(5)
+            self.assertFalse(thread.is_alive(), "runtime monitor outlived its test")
+        for name in ("run", "popen", "network"):
+            self.guards[name].assert_not_called()
+
+    def _start(self, interval_seconds=30):
+        self.service.start_health_monitor(interval_seconds=interval_seconds)
+        self.monitors.append(self.service._health_thread)
+        return self.service._health_thread
+
+    def _blocking_docker_version(self, entered, version="27.1.0"):
+        """Stand in for system.run at the real _docker_health command boundary."""
+        def run(argv, **kwargs):
+            self.assertEqual(argv, DOCKER_VERSION_ARGV)
+            self.assertEqual(kwargs, {"timeout": 10})
+            entered.set()
+            self.assertTrue(self.release.wait(10), "blocked probe was never released")
+            return version + "\n"
+        self.guards["docker"].side_effect = run
+
+    def _record_refreshes(self):
+        calls, refreshed = [], Event()
+        def refresh():
+            calls.append(threading.current_thread())
+            refreshed.set()
+        self.service._refresh_runtime_snapshot = refresh
+        return calls, refreshed
+
+    @staticmethod
+    def _live_monitors():
+        return [thread for thread in threading.enumerate()
+                if thread.name == MONITOR_THREAD and thread.is_alive()]
+
+    def _row(self):
+        with sqlite3.connect(self.state.db_path) as connection:
+            return connection.execute("SELECT * FROM runtime_snapshot WHERE singleton=1").fetchone()
+
+    def test_parallel_starts_admit_exactly_one_monitor_with_one_initial_tick(self):
+        probes = []
+        self.service._docker_health = lambda: probes.append(1) or {"ok": True, "version": "fixture"}
+        refreshes, refreshed = self._record_refreshes()
+        barrier = threading.Barrier(8)
+        def start():
+            barrier.wait(5)
+            self.service.start_health_monitor(interval_seconds=30)
+        starters = [threading.Thread(target=start) for _ in range(8)]
+        for starter in starters:
+            starter.start()
+        for starter in starters:
+            starter.join(5)
+            self.assertFalse(starter.is_alive())
+        self.monitors.append(self.service._health_thread)
+
+        self.assertTrue(refreshed.wait(2), "first tick did not run promptly")
+        self.assertEqual(self._live_monitors(), [self.service._health_thread])
+        self.assertTrue(self.service._health_thread.daemon)
+        self.assertEqual((len(probes), len(refreshes)), (1, 1))
+        self.assertEqual(refreshes, [self.service._health_thread])
+
+        started = time.monotonic()
+        self.service.stop_health_monitor()
+        self.assertLess(time.monotonic() - started, 2, "idle monitor did not stop promptly")
+        self.assertFalse(self.service._health_thread.is_alive())
+        self.assertEqual((len(probes), len(refreshes)), (1, 1))
+
+    def test_health_rpc_serves_cached_copy_while_docker_probe_is_blocked(self):
+        entered = Event()
+        self._blocking_docker_version(entered)
+        _refreshes, refreshed = self._record_refreshes()
+        self._start()
+        self.assertTrue(entered.wait(2))
+
+        started = time.monotonic()
+        response = self.service.handle("health")
+        self.assertLess(time.monotonic() - started, 0.5, "health waited behind the Docker probe")
+        self.assertEqual(set(response), {"ok", "service", "version", "docker"})
+        self.assertEqual(response["docker"], {"ok": None, "status": "not checked"})
+        response["docker"]["ok"] = "tampered"
+        self.assertEqual(self.service.health()["docker"], {"ok": None, "status": "not checked"})
+        self.assertEqual(self.guards["docker"].call_count, 1, "health read invoked Docker")
+
+        self.release.set()
+        self.assertTrue(refreshed.wait(2))
+        published = self.service.health()["docker"]
+        self.assertEqual(published, {"ok": True, "version": "27.1.0"})
+        published["version"] = "tampered"
+        self.assertEqual(self.service.health()["docker"], {"ok": True, "version": "27.1.0"})
+
+    def test_docker_probe_failure_projection_is_safe(self):
+        self.guards["docker"].side_effect = CommandError(
+            DOCKER_VERSION_ARGV, "Cannot connect PASSWORD=fixture-secret /private/docker.sock")
+        self.assertEqual(self.service._docker_health(), {"ok": False, "error": "Docker daemon unavailable"})
+
+    def test_runtime_success_classified_failure_and_recovery_through_facade(self):
+        first, recovered = container("a" * 64), container("b" * 64, name="web")
+        outcomes = iter([
+            [first],
+            RuntimeProbeError("docker_unavailable", stage="list", failure_class="CommandError", exit_code=1),
+            ValueError("unexpected PASSWORD=fixture-secret"),
+            [recovered],
+        ])
+        def collect(config):
+            self.assertIs(config, self.service.config)
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        def parsed(value):
+            return datetime.fromisoformat(value)
+
+        with mock.patch("docker_update_manager.webservice.collect_runtime_containers", side_effect=collect):
+            self.service._refresh_runtime_snapshot()
+            success = self.state.runtime_snapshot()
+            self.assertEqual(success["status"], "current")
+            self.assertLessEqual(parsed(success["attempted_at"]), parsed(success["captured_at"]))
+            self.assertEqual([item["container_id"] for item in success["containers"]], ["a" * 64])
+            stale_at = (parsed(success["captured_at"]) + timedelta(seconds=91)).isoformat()
+            self.assertEqual(self.state.runtime_snapshot(now=stale_at)["status"], "stale")
+
+            for category in ("docker_unavailable", "probe_failed"):
+                with self.assertLogs("docker_update_manager.webservice", level="WARNING") as captured:
+                    self.service._refresh_runtime_snapshot()
+                failed = self.state.runtime_snapshot()
+                self.assertEqual((failed["status"], failed["attempt_success"], failed["failure_category"]),
+                                 ("unavailable", False, category))
+                self.assertEqual(failed["captured_at"], success["captured_at"])
+                self.assertEqual(failed["containers"], success["containers"])
+                self.assertGreater(parsed(failed["attempted_at"]), parsed(success["captured_at"]))
+                self.assertNotIn("fixture-secret", "\n".join(captured.output))
+
+            self.service._refresh_runtime_snapshot()
+        current = self.state.runtime_snapshot()
+        self.assertEqual((current["status"], current["failure_category"]), ("current", None))
+        self.assertGreater(parsed(current["captured_at"]), parsed(success["captured_at"]))
+        self.assertEqual([item["container_id"] for item in current["containers"]], ["b" * 64])
+        self.assertNotIn("fixture-secret", json.dumps(current))
+
+    def test_persistence_failures_leave_previous_row_untouched(self):
+        self.state.save_runtime_snapshot([container("a" * 64)])
+        before = self._row()
+        secret = "SQLite /private/state PASSWORD=fixture-secret"
+
+        with mock.patch("docker_update_manager.webservice.collect_runtime_containers",
+                        return_value=[container("b" * 64)]), \
+             mock.patch.object(self.state, "save_runtime_snapshot", side_effect=sqlite3.OperationalError(secret)), \
+             mock.patch.object(self.state, "record_runtime_failure",
+                               wraps=self.state.record_runtime_failure) as record_failure:
+            with self.assertLogs("docker_update_manager.webservice", level="WARNING") as saved:
+                self.service._refresh_runtime_snapshot()
+        record_failure.assert_not_called()
+        self.assertEqual(self._row(), before)
+
+        with mock.patch("docker_update_manager.webservice.collect_runtime_containers",
+                        side_effect=RuntimeProbeError("inventory_changed", stage="inspect")), \
+             mock.patch.object(self.state, "record_runtime_failure", side_effect=OSError(secret)):
+            with self.assertLogs("docker_update_manager.webservice", level="WARNING") as recorded:
+                self.service._refresh_runtime_snapshot()
+        self.assertEqual(self._row(), before)
+        snapshot = self.state.runtime_snapshot()
+        self.assertEqual((snapshot["attempt_success"], snapshot["failure_category"]), (True, None))
+
+        output = "\n".join(saved.output + recorded.output)
+        self.assertIn("Runtime snapshot persistence failed stage=persist failure_class=OperationalError", output)
+        self.assertIn("Runtime failure persistence failed stage=persist category=inventory_changed "
+                      "failure_class=OSError", output)
+        for private in ("fixture-secret", "/private", "password"):
+            self.assertNotIn(private, output.lower())
+
+    def _late_monitor_against_reconcile(self, monitor_outcome):
+        old_id, new_id = "c" * 64, "d" * 64
+        previous_key = "container/" + old_id
+        entered, done = Event(), Event()
+        def collect(_config):
+            entered.set()
+            self.assertTrue(self.release.wait(10), "blocked collection was never released")
+            if isinstance(monitor_outcome, Exception):
+                raise monitor_outcome
+            return monitor_outcome
+        refresh = self.service._refresh_runtime_snapshot
+        def refresh_then_signal():
+            try:
+                refresh()
+            finally:
+                done.set()
+        self.service._docker_health = lambda: {"ok": True, "version": "fixture"}
+        self.service._refresh_runtime_snapshot = refresh_then_signal
+
+        with mock.patch("docker_update_manager.webservice.collect_runtime_containers", side_effect=collect), \
+             mock.patch.object(self.state, "save_runtime_snapshot",
+                               wraps=self.state.save_runtime_snapshot) as monitor_save, \
+             mock.patch.object(self.state, "record_runtime_failure",
+                               wraps=self.state.record_runtime_failure) as monitor_failure:
+            self._start()
+            self.assertTrue(entered.wait(2), "monitor never reached collection")
+            reconciled_at = datetime.now(timezone.utc).isoformat()
+            self.state.reconcile_runtime(previous_key, [container(new_id, name="replacement")],
+                                         attempted_at=reconciled_at)
+            expected = self.state.runtime_snapshot()
+            with self.assertLogs("docker_update_manager.webservice", level="WARNING") as captured:
+                logging.getLogger("docker_update_manager.webservice").warning("late publication marker")
+                self.release.set()
+                self.assertTrue(done.wait(2), "monitor did not publish after release")
+        if isinstance(monitor_outcome, Exception):
+            self.assertIn("category=docker_unavailable", "\n".join(captured.output))
+
+        attempts = [call.kwargs["attempted_at"] for call in monitor_save.call_args_list + monitor_failure.call_args_list]
+        self.assertEqual(len(attempts), 1, "monitor did not attempt exactly one late publication")
+        self.assertLess(datetime.fromisoformat(attempts[0]), datetime.fromisoformat(reconciled_at))
+        self.assertEqual(self.state.runtime_snapshot(), expected)
+        self.assertEqual(expected["attempted_at"], reconciled_at)
+        self.assertEqual([item["container_id"] for item in expected["containers"]], [new_id])
+        invalidated = {item["service_key"]: item["invalidated"] for item in self.state.verification_snapshot()}
+        self.assertIs(invalidated.get(previous_key), True)
+
+    def test_late_monitor_success_cannot_overwrite_newer_reconciliation(self):
+        self._late_monitor_against_reconcile([container("c" * 64)])
+
+    def test_late_monitor_failure_cannot_overwrite_newer_reconciliation(self):
+        self._late_monitor_against_reconcile(RuntimeProbeError("docker_unavailable", stage="list"))
+
+    def test_stop_during_blocked_probe_is_bounded_and_never_duplicates_monitor(self):
+        entered = Event()
+        self._blocking_docker_version(entered)
+        refreshes, _refreshed = self._record_refreshes()
+        first = self._start()
+        self.assertTrue(entered.wait(2))
+
+        started = time.monotonic()
+        self.service.stop_health_monitor()
+        elapsed = time.monotonic() - started
+        # The existing join bound is 6 s; a probe blocked past it keeps running.
+        self.assertGreaterEqual(elapsed, 5.5)
+        self.assertLess(elapsed, 7.5)
+        self.assertTrue(first.is_alive())
+
+        # Existing defect E1 (issue #5): this start is currently a no-op that leaves no
+        # monitor once the old thread exits. Only the safety property is asserted here:
+        # a restart must never run two monitors at once.
+        self._start()
+        self.assertLessEqual(len(self._live_monitors()), 1)
+
+        self.release.set()
+        first.join(5)
+        self.assertFalse(first.is_alive(), "stopped monitor did not exit after its probe returned")
+        # Existing defect E2 (issue #5): a stopped thread may still publish once after
+        # its blocked probe. It must never start a further tick.
+        self.assertLessEqual(sum(thread is first for thread in refreshes), 1)
+        self.assertLessEqual(len(self._live_monitors()), 1)
+
+    def test_agent_server_checks_schema_before_socket_and_owns_monitor_lifecycle(self):
+        events = []
+        socket_path = self.root / "agent.sock"
+        ensure_compatible = self.state.ensure_compatible
+        start, stop = self.service.start_health_monitor, self.service.stop_health_monitor
+        def check_schema():
+            events.append(("schema", socket_path.exists()))
+            return ensure_compatible()
+        def start_monitor(*args, **kwargs):
+            events.append(("start", socket_path.exists()))
+            result = start(*args, **kwargs)
+            self.monitors.append(self.service._health_thread)
+            return result
+        def stop_monitor():
+            events.append(("stop", socket_path.exists()))
+            return stop()
+        def accept(_socket):
+            events.append(("accept", socket_path.exists()))
+            raise _StopServing()
+        self.service._docker_health = lambda: {"ok": True, "version": "fixture"}
+        self._record_refreshes()
+        self.service.start_health_monitor, self.service.stop_health_monitor = start_monitor, stop_monitor
+
+        with mock.patch.object(self.state, "ensure_compatible", side_effect=check_schema), \
+             mock.patch.object(socket.socket, "accept", accept):
+            with self.assertRaises(_StopServing):
+                AgentServer(self.service, str(socket_path), allow_test_paths=True).serve_forever()
+
+        self.assertEqual(events, [("schema", False), ("start", True), ("accept", True), ("stop", True)])
+        self.assertFalse(socket_path.exists())
+        self.assertFalse(self.monitors[-1].is_alive(), "agent server left the monitor running")
 
 
 if __name__ == "__main__":
