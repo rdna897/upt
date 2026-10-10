@@ -17,10 +17,10 @@ The repository-policy safeguards are tracked separately in [PR #1](https://githu
 
 | Stage | Candidate boundary | Gate |
 | --- | --- | --- |
-| 3 | Runtime health/snapshot coordination; evaluate extraction versus tests-only | [Draft Phase 3 specification](phase3-runtime-health-snapshot.md), [issue #3](https://github.com/rdna897/upt/issues/3); architecture review complete, recommends tests-only (Option A); awaiting owner decision |
+| 3 | Runtime health/snapshot coordination; evaluate extraction versus tests-only | [Draft Phase 3 specification](phase3-runtime-health-snapshot.md), [issue #3](https://github.com/rdna897/upt/issues/3); owner approved Option A (tests only; extraction not warranted); tests-only implementation PR pending owner acceptance. Deferred defects: [#5](https://github.com/rdna897/upt/issues/5), [#6](https://github.com/rdna897/upt/issues/6) |
 | 4 | Compose observation/eligibility versus mutating/trust authority | Needs separate public-safe specification and owner-approved boundary |
 | 5 | Update, rollback and Compose mutation coordination | Needs separate design/implementation reviews |
-| 6 | SQLite state boundaries without fragmenting transactions | Evaluate transaction ownership **before** accepting detailed Stage 4/5 designs |
+| 6 | SQLite state boundaries without fragmenting transactions | Evaluate transaction ownership **before** accepting detailed Stage 4/5 designs; include runtime-snapshot ordering debt ([#6](https://github.com/rdna897/upt/issues/6)) |
 | 7 | Web request adapters and presentation boundaries | Preserve auth, CSRF, sessions, SSE and wire contracts |
 | 8 | Combined integration, security, compatibility and release-readiness closure | Full clean-tree CI, isolated rehearsal, rollback evidence and separate deployment approval |
 

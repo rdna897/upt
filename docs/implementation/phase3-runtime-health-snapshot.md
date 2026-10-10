@@ -1,6 +1,6 @@
 # Architectural refactoring — Phase 3: runtime health and snapshot coordination
 
-**Status:** Draft — independent architecture review complete; **awaiting owner decision** (see [Owner decisions](#owner-decisions-required-before-implementation)). Implementation is **not** authorised by this document.
+**Status:** Ready — owner approved Option A (tests only) on 2026-10-10 (see [Owner decisions](#owner-decisions)). Implementation is limited to `tests/test_runtime_health.py`; no production-code change is authorised.
 **Canonical repository:** `rdna897/upt` (public).
 **Baseline:** `main` at `cc16dc74b998ea869490d3b291b8ddbf886c3859` (revalidate before implementation; re-run the review if any file in the [ownership map](#current-public-source-and-ownership-map-baseline) changed).
 **Tracking:** [Architecture Phase 3 — issue #3](https://github.com/rdna897/upt/issues/3).
@@ -15,7 +15,7 @@ This phase must establish whether further extraction is justified **at all**. `r
 
 ## Review decision (summary)
 
-**Recommended: Option A — no production-code extraction; close the identified lifecycle, ordering and seam-coverage test gaps.** Option B is a reasonable fallback only if the owner explicitly wants the publication routine moved, under the constraints in [Option B conditions](#option-b-conditions-only-if-the-owner-overrides-the-recommendation). Option C is rejected.
+**Approved: Option A — no production-code extraction; close the identified lifecycle, ordering and seam-coverage test gaps.** Extraction is recorded as **not warranted**. Option B was not selected; its [conditions](#option-b-conditions-only-if-the-owner-overrides-the-recommendation) are retained only as guidance for any future reconsideration. Option C is rejected.
 
 Rationale in one line: the monitor code is already small (about 80 lines across five methods in a 3,650-line module), has a single external dependency direction (`webservice` → `runtime`/`state`), and its private names are relied on by tests in four suites; extraction would move about 45 lines while adding comparable glue and new seam risk, without removing any coupling that causes a present maintenance problem.
 
@@ -121,6 +121,8 @@ None of these is removed by moving `_refresh_runtime_snapshot` into another modu
 
 ## Existing behaviour and defects (not to be fixed in Phase 3)
 
+Tracking: E1–E3 [issue #5](https://github.com/rdna897/upt/issues/5); E4–E5 [issue #6](https://github.com/rdna897/upt/issues/6).
+
 Verified on the baseline with synthetic, Docker-free probes. These are **existing** behaviours. Phase 3 must neither fix nor worsen them silently; each fix is a separate reviewed change if the owner wants it.
 
 | ID | Severity | Existing behaviour | Evidence |
@@ -173,16 +175,20 @@ No change to any file under `src/`.
 
 Fixing E1–E5; moving `_docker_health`, `health`, `start_health_monitor` or `stop_health_monitor`; changing `runtime.py` collection; any `State` schema, migration, transaction or ordering-guard change; changing `reconciliation.py`; new Docker commands, registry scans, Compose/update/rollback flow, auth/session changes, firewall/systemd/repository settings, production diagnostics or broad formatting. These are distinct reviewed tasks if ever required.
 
-## Owner decisions required before implementation
+## Owner decisions
 
-- **D1 — Outcome:** accept Option A (tests only; extraction recorded as not warranted), or explicitly select Option B under its conditions.
-- **D2 — Existing defect E1 (restart no-op after timed-out stop):** leave documented, or open a separate issue/PR for a fix (for example, per-generation stop events). Must not be bundled into Phase 3.
-- **D3 — E2–E4:** accept as documented limitations, or track separately.
+Recorded 2026-10-10 after independent review of commit `e7aa0f97127265a9646d2a5b74cc503b1df191f2`.
+
+- **D1 — Approved: Option A.** No production-code extraction; no new runtime monitor module or class; all existing public and internal runtime contracts preserved. Implement the seven test groups above in `tests/test_runtime_health.py`. Extraction is recorded as **not warranted** (a completed outcome, not deferred work). Option B and Option C are not authorised.
+- **D2 — E1 tracked separately** in [issue #5](https://github.com/rdna897/upt/issues/5), not fixed in Phase 3. A later lifecycle correction must design E1 and E2 together.
+- **D3 — E2–E4 accepted as documented limitations for Phase 3** and tracked separately: E2–E3 with E1 in [issue #5](https://github.com/rdna897/upt/issues/5); E4 with E5 in [issue #6](https://github.com/rdna897/upt/issues/6). E5 is retained as technical debt and is an input to the Phase 6 SQLite boundary review.
+
+Phase 3 tests may reproduce and document E1–E5 but must not assert them as desired long-term behaviour.
 
 ## Deliverables, gates and freeze
 
 **This PR:** documents the Phase 3 review, decision and acceptance criteria only. It makes no runtime/code/test changes.
 
-**After owner approval only:** one separate narrowly scoped implementation PR against the then-current public `main`, meeting the acceptance criteria above, with separate owner merge approval. Do not merge automatically.
+**Implementation (approved, D1):** one separate narrowly scoped tests-only PR against the then-current public `main`, meeting the acceptance criteria above, with separate owner merge approval. Do not merge automatically. Phase 3 is not complete until the owner accepts that PR's outcome.
 
 **Freeze:** never install, rebuild, restart or redeploy UPT; never change production Compose, Docker, SQLite, secrets, caches or snapshots. Completion or merge of Phase 3 is not permission for a release or production deployment.
