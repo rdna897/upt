@@ -117,26 +117,38 @@ def _image_info(accounting,image_id):
 
 def rollback_points(cfg,state,now=None,image_details=False):
     if not state.db_path.exists(): return []
-    _migrate_refs(state); days=_settings(cfg)["rollback_images_days"]; now=_utc(now)
-    with state.connect() as c:
+    days=_settings(cfg)["rollback_images_days"]; now=_utc(now)
+    # Legacy protected_images rows without a rollback_refs entry previously
+    # caused a write during inventory (_migrate_refs). Project the same rows
+    # without mutating state; the real cleanup path still materialises them.
+    with state.read() as c:
         c.row_factory=sqlite3.Row
-        rows=c.execute("SELECT r.*,h.stack,h.service,h.old_image,h.old_version,h.old_digest,h.result FROM rollback_refs r LEFT JOIN history h ON h.id=r.history_id ORDER BY r.created DESC").fetchall()
-        accounting=_docker_image_accounting() if image_details else {}
-        out=[]
-        for row in rows:
-            item=dict(row); expiry=expires(item["created"],days); item["expires"]=expiry.isoformat()
-            purge=item.get("purge_status") or ""
-            if purge in TERMINAL_PURGE_STATUSES: item["status"]=purge
-            elif purge=="SKIPPED - IMAGE IN USE": item["status"]="IMAGE IN USE"
-            else: item["status"]="EXPIRED" if expiry<=now or item["expired"] else "AVAILABLE"
-            info=_image_info(accounting,item["image_id"]); item.update(info)
-            item["image"]=info.get("image") or item.get("old_image") or item["image_id"]
-            item["size"]=info.get("size")
-            item["unique_size"]=info.get("unique_size")
-            item["containers"]=info.get("containers")
-            item["potential_reclaimable"]=(info.get("unique_size") or 0) if info.get("containers")==0 else 0
-            out.append(item)
-        return out
+        rows=c.execute(
+            "SELECT r.*,h.stack,h.service,h.old_image,h.old_version,h.old_digest,h.result "
+            "FROM (SELECT history_id,image_id,created,expired,purge_status FROM rollback_refs "
+            "UNION ALL "
+            "SELECT p.history_id,p.image_id,p.created,0,NULL FROM protected_images p "
+            "WHERE NOT EXISTS (SELECT 1 FROM rollback_refs existing WHERE existing.history_id=p.history_id)"
+            ") r LEFT JOIN history h ON h.id=r.history_id ORDER BY r.created DESC"
+        ).fetchall()
+    # Docker may take up to 120 seconds. Neither a write reservation nor a
+    # read snapshot should be held while the subprocess is running.
+    accounting=_docker_image_accounting() if image_details else {}
+    out=[]
+    for row in rows:
+        item=dict(row); expiry=expires(item["created"],days); item["expires"]=expiry.isoformat()
+        purge=item.get("purge_status") or ""
+        if purge in TERMINAL_PURGE_STATUSES: item["status"]=purge
+        elif purge=="SKIPPED - IMAGE IN USE": item["status"]="IMAGE IN USE"
+        else: item["status"]="EXPIRED" if expiry<=now or item["expired"] else "AVAILABLE"
+        info=_image_info(accounting,item["image_id"]); item.update(info)
+        item["image"]=info.get("image") or item.get("old_image") or item["image_id"]
+        item["size"]=info.get("size")
+        item["unique_size"]=info.get("unique_size")
+        item["containers"]=info.get("containers")
+        item["potential_reclaimable"]=(info.get("unique_size") or 0) if info.get("containers")==0 else 0
+        out.append(item)
+    return out
 
 def _image_exists(image_id):
     try: run(["docker","image","inspect",image_id],timeout=30); return True
