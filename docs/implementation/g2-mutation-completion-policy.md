@@ -136,9 +136,9 @@ Three cases are distinct:
 3. **Post-restart / post-worker reconciliation** (`recover_abandoned_operations`, which requires the update lock). This ships alongside **S1 web correctness**, not S4. For a stale update/rollback operation:
    - **No committed guard** and the operation was created by a P11-aware binary (`summary.completion_protocol >= 1` recorded at operation creation, independently of guard insertion) → the boundary was never authorised → `blocked`, "no changes were made", subject to proving no effect path bypasses P11.
    - **No guard** on a legacy operation → today's behaviour is retained (`failed`, "check the container and History"), because absence proves nothing.
-   - **Fence row present (active, manual or resolved)** and exactly one matching committed history row (same completion key and `old_image_id` as the guard) → the terminal status the in-process adapter would have published for that row under case 1, with the warning "terminal state recovered after interruption".
+   - **Fence row present (active, manual or resolved)** and exactly one matching committed history row (same completion key, exact service owner and original running-image claim as the fence) → the terminal status the in-process adapter would have published for that row under case 1, with the warning "terminal state recovered after interruption".
    - **Unresolved fence present** and no row, a contradictory row, or reads that fail → **unresolved**. `mutation_performed: null`, `outcome_verified: false`, `manual_reconciliation_required: true`. Never `succeeded` or `failed`.
-   - **Never replay.** Recovery issues no Docker or Compose command and does not restore sources. The operation-scoped guard, every independently owned image protection, and all guarded backup paths are retained.
+   - **Never replay.** Recovery issues no Docker or Compose command and does not restore sources. The unresolved fence and every independently owned image protection and backup claim are retained. If History was already published with a resolved fence, retain that correlated evidence until terminal recovery completes.
    - If the database is unavailable at restart, recovery cannot run and the operation stays active; the API reports the database error rather than a status. The contract applies once the database is readable again.
 
 The web rollback `NO CHANGES MADE` fallback (`webservice.py:2147-2165`) may run only when the adapter can prove the boundary was not crossed: a new-protocol operation has no committed guard, and the in-memory boundary flag is false.
@@ -194,7 +194,7 @@ G2-S0 advances the minimum durable CLI completion identity, independent image/ba
 
 ## 6. Synthetic test plan
 
-All tests use `tests/sqlite_faults.py` (modes `before_commit`, `after_commit`, `unavailable`; matchers `history_insert`, `terminal_operation_update`), temporary databases, every Docker/Compose/registry boundary mocked, and a fake monotonic clock and sleep. Extending the harness with a read-failure fault and a marker-write matcher is part of S0/S1 (tests only).
+All tests use `tests/sqlite_faults.py` (modes `before_commit`, `after_commit`, `unavailable`; matchers `history_insert`, `terminal_operation_update`), temporary databases, every Docker/Compose/registry boundary mocked, and a fake monotonic clock and sleep. Extending the harness with read-failure, dedicated fence-insert and claim-write matchers is part of S0a/S0b/S0c (synthetic tests only).
 
 For each of ordinary update, pinned update, CLI rollback, web rollback and the web update adapter:
 
@@ -205,11 +205,11 @@ For each of ordinary update, pinned update, CLI rollback, web rollback and the w
 5. Pre-existing row with the same key and a different `result` or `new_image_id` → `contradictory`; no insert; reported as a contradiction, not success.
 6. `before_commit` until the deadline → `not_committed`; no row; `CompletionPublicationIncomplete`; one ERROR completion log; no compensating Docker call; the pinned source keeps the new pin.
 7. `unavailable` → as 6, plus CLI exit 30 with the stderr contract and no traceback.
-8. Deadline: fake clock asserts total elapsed time ≤ budget across writes, reads and back-off, and no SQLite step starts after the deadline.
+8. Deadline: fake clock asserts no new SQLite step begins past the budget and each timeout is bounded by remaining time; an already-running commit is allowed its documented non-interruptible tail.
 9. Failure-path row under unavailability → the original workload error stays primary.
-10. P11: operation creation/guard-write failure refuses before any Docker call (W = `not_started`); a committed operation-scoped guard prevents every UPT image-removal and backup-expiry path, including forced overrides, while preserving existing `state.protected()` rows. An independent protection remains intact before and after a legitimate committed History write. A matching successful completion releases only its own guard.
-11. P11 ownership: two guards sharing one image remain independent; releasing one never releases the other. An existing `NULL history_id` namespace/manual-recovery row survives byte-for-byte; attempting to overwrite that owner fails closed. A stale/active guard prevents mutation admission on the same service/image and cannot be erased by `prune_operations`.
-12. Web P8: a `terminal_operation_update("succeeded")` fault is never converted to failed. Recovery with guard plus committed row → terminal from the row; guard and no row → unresolved; **protocol capability recorded on creation** plus no guard → blocked; legacy operation without capability → today's behaviour. Guarded image and backup survive recovery; no Docker call occurs in any recovery case. Also test interruption between History and guard release.
+10. P11: pre-boundary fence/claim insert failure refuses before any Docker action; committed schema-10 claims block every UPT image/backup deletion path, including forced overrides. Existing protections and rollback refs remain intact; the matching History transaction resolves exactly one named fence.
+11. P11 ownership: two fences may share an image claim; resolving one never releases the other. An existing `NULL history_id` manual/namespace protection remains byte-for-byte intact, while a distinct rollback ref may be inserted. Admission refuses conflicting **service identities** (not unrelated shared-image services), including logical-key drift. Namespace and bootstrap evidence must not be pruned by G2.
+12. Web P8: a `terminal_operation_update("succeeded")` fault is never converted to failed. Recovery with guard plus committed row → terminal from the row; guard and no row → unresolved; **protocol capability recorded on creation** plus no guard → blocked; legacy operation without capability → today's behaviour. Guarded image and backup survive recovery; no Docker call occurs in any recovery case. Also test failure after atomic History/fence resolution but before a web terminal write, followed by recovery.
 13. P9: a mismatched `new_image_id` refuses; a matching row still rolls back.
 
 Each slice replaces the matching characterisation tests in `tests/test_sqlite_completion_characterisation.py` with explicit replacement tests in the same PR. Genuine workload-failure recovery tests (including `pre_recovery_check` refusal and operator-edit protection) must remain and pass.
@@ -275,7 +275,7 @@ Provisional direction is as recorded from the owner's review instructions (2026-
   - (M4) the deadline bounded writes only → P4 single monotonic deadline covering every completion-side step.
 - **Independent review of `84d5170`:** identified manual ownership collision, expiry of backup evidence, missing mutation admission and inconsistent protocol capability; the first S0 architecture was proposed.
 - **Independent Opus review of `8acdac5`:** H1–H4 found summary-only fencing incompatible with existing gate semantics, synthetic CLI web-operation lifecycle, no safe resolution path and non-atomic guard release. M1–M6 identified admission/removal bypasses, shared-image overblocking, web evidence leaks, missing rollback claims, batch retention and late post-restart recovery.
-- **Independent Opus re-review of `740555e`:** shared `compose_bootstrap_fences` reuse conflicts with namespace updates and in-flight web revalidation, and schema 9 cannot mechanically exclude older cleaners. M1–M5 require protection ownership, stable identity, strict claims, release evidence and G2-only pruning. The [new S0 schema-10 proposal](g2-s0-recovery-fence-design.md) makes Option B the preferred planning direction, subject to owner approval.
+- **Independent Opus re-review of `740555e`:** shared `compose_bootstrap_fences` reuse conflicts with namespace updates, while new G2 fences require precise in-flight own-operation revalidation; schema 9 cannot mechanically exclude older cleaners. M1–M5 require protection ownership, stable identity, strict claims, release evidence and G2-only pruning. The [new S0 schema-10 proposal](g2-s0-recovery-fence-design.md) makes Option B the preferred planning direction, subject to owner approval.
 
 ## 12. Design acceptance gate
 
