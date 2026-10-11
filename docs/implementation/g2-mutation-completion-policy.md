@@ -4,7 +4,7 @@
 **Tracking:** [issue #9](https://github.com/rdna897/upt/issues/9) (S6-R1, R1b, R2, R3).
 **Prerequisites:** [Stage 6a transaction-ownership decision](stage6-sqlite-state-ownership-review.md); merged [G2 characterisation PR #13](https://github.com/rdna897/upt/pull/13); merged [R10 PR #14](https://github.com/rdna897/upt/pull/14).
 **Deployment:** Production freeze remains in force. No Docker changes or live databases in development/tests.
-**S0 foundation:** [revised typed-fence design](g2-s0-recovery-fence-design.md) (provisional after independent Opus review, not approved). Earlier `protected_images` upsert and CLI `operation_runs` approaches are withdrawn.
+**S0 foundation:** [schema-10 recovery-fence design](g2-s0-recovery-fence-design.md), recommended after independent Opus re-review of `740555e`. This is a planning direction, not owner approval. The `protected_images` upsert, summary-only CLI journal and shared bootstrap-fence designs are withdrawn.
 
 ## Problem and required contract
 
@@ -17,7 +17,7 @@ The proposal must specify, per mutation path:
 3. **Idempotent publication:** bounded attempts, stable deduplication/reconciliation for errors before commit and ambiguous errors *after* commit, and no duplicate/contradictory history or terminal state.
 4. **Recovery safety:** rollback eligibility, active image protection and source/backup evidence stay safe when history or terminal status is missing/ambiguous. Do not silently expire the sole usable recovery point.
 5. **Persistent unavailability:** distinguish observed success from unknown persistence; do not claim durable success if writes cannot be verified. Define explicit CLI exit/error output, agent logs and web operation visibility, including what a later operator must reconcile.
-6. **Transaction ownership:** preserve single-transaction atomic publication where required; do not hold SQLite transactions across Docker or Compose effects. Maintain core/web separation, existing locks and schema compatibility.
+6. **Transaction ownership:** preserve single-transaction atomic publication where required; do not hold SQLite transactions across Docker or Compose effects. Maintain core/web separation, existing locks and explicit schema migration/compatibility gates.
 
 ## 1. Current behaviour by call path
 
@@ -84,7 +84,7 @@ One core helper (proposed `src/docker_update_manager/completion.py`; the name is
 
 ### P3 — Completion key
 
-A 32-hex `completion_id` is fixed before the mutation boundary: web operations use their `operation_id` and CLI operations generate a uuid4 hex. It is stored in history `details.completion_id` and in the independent P11 operation-scoped guard. P11 uses a durable **CLI fence row** independent of web `operation_runs`, bringing forward only a bounded G3 identity foundation. Lookup is a bounded `history_for_service(stack, service)` scan filtered by `action` and parsed `details.completion_id`, the pattern Compose apply already uses (`webservice.py:2625-2628`). There is no `json_extract` dependency. No uniqueness index is proposed here; P5 and update-lock single-writer semantics require explicit verification, not assumption.
+A 32-hex `completion_id` is fixed before the mutation boundary: web operations use their `operation_id` and CLI operations generate a uuid4 hex. It is stored in History `details.completion_id` and the new schema-10 `completion_fences` owner. CLI does **not** create a web `operation_runs` row. Lookup is a bounded `history_for_service(stack, service)` scan filtered by `action` and parsed `details.completion_id`, the pattern Compose apply already uses (`webservice.py:2625-2628`). There is no `json_extract` dependency. No uniqueness index is proposed here; P5 and update-lock single-writer semantics require explicit verification, not assumption.
 
 ### P4 — One monotonic completion deadline
 
@@ -151,23 +151,25 @@ Protection rules are unchanged except for P11. Eligibility (`operations.py:387-3
 
 ### P10 — Transaction ownership and compatibility
 
-No SQLite transaction spans Docker/Compose effects or sleeps. History and its protection stay one transaction (`State.record`). Core/web separation, locks, schema 9 and the namespace update/Apply contracts are unchanged; namespace publication is not routed through the new helper without separate approval.
+No SQLite transaction spans Docker/Compose effects or sleeps. History, normal rollback refs, non-destructive existing protections and a matching completion-fence resolution commit in one `State.record` transaction. G2 introduces **schema 10 via separately approved explicit offline migration**; namespace update/Apply retain their existing separate fence and publication contracts. Core/web separation and locks remain.
 
-### P11 — Typed, service-scoped completion fence (revised D3/D10)
+### P11 — Schema-10 recovery owner and claims (revised D3/D10)
 
-The earlier proposals to replace a `protected_images` row and to store CLI guards in `operation_runs.summary` are **withdrawn**. Both have confirmed safety or lifecycle problems. The [revised G2-S0 design](g2-s0-recovery-fence-design.md) proposes a **typed, bounded, versioned** G2 evidence record in the existing `compose_bootstrap_fences` table, with `operation_id=completion_id` and the proven `logical_key`. CLI uses an independent fence ID, **not a web `operation_runs` row**. Web operations record protocol capability at creation, independently of the later fence.
+The chosen planning direction is **Option B**, a dedicated `completion_fences` table plus indexed `completion_fence_claims`, with independent image/backup claims and service identity. See [S0 schema-10 design](g2-s0-recovery-fence-design.md). The original `protected_images` replacement, `operation_runs.summary` CLI journal and shared `compose_bootstrap_fences` approaches are withdrawn. This is not approval to implement.
 
-The fence claims the service identity, required image IDs and exact recovery backup paths. Admission is service-keyed; image/backup cleanup checks **all independent claimants**. Update, pinned update, rollback, remove, restart, convert, restore-compose, forced retention and direct image removal must fail closed wherever they can interfere. A shared image must not block unrelated service mutations solely because its bytes are shared. Preserve unrelated NULL-history/manual protection owners without `INSERT OR REPLACE`.
+The G2 fence is keyed by durable `completion_id` and an exact `logical_key`, with additional (stack, Compose service) cross-checks so edited file lists or moved projects cannot silently bypass unresolved identity. **Admission is per service, not per shared image**. Separate claim rows protect the currently running and rollback-target images as appropriate, plus every required recovery backup; image claims block destructive cleanup, not unrelated service updates.
 
-Arm the fence in core immediately before the earliest possible side effect, after backup and final identity proof. If its commit is ambiguous, authorise no Docker action until the guard is positively observed. A matching factual History row, rollback refs and fence resolution commit **atomically in one State transaction**. Resolve a guard following pre-boundary refusal or genuine recovery only with proof; otherwise retain it. Do not activate guards on a path whose existing false-FAILED completion handler is still in place.
+S0 requires an explicit offline schema-9→10 transition, reliable older-binary incompatibility and a safe state-preserving rollback gate. **Namespace-consumer updates continue to use their existing namespace fence unchanged**, avoiding dual arming and duplicate ID/key collisions. An internal web revalidation may exempt **only its verified own G2 fence**, never an arbitrary user-supplied ID or any other bootstrap/namespace fence.
 
-S0 must add guard-aware image and backup retention, prove no additional mutation/delete bypasses, and provide a **minimal audited, operator-only verification/release mechanism** before writer activation. No blind force-unlock or fabricated success. Preserve namespace/bootstrap fence semantics, protect all evidence across crashes, prevent pruning of unresolved guards and eliminate browser/API/SSE evidence leaks.
+Arm G2 in core after backups, before the earliest effect; failed/ambiguous guard creation blocks the mutation until exact presence is proved. A matching truthful History entry, image rollback refs and **conditional fence resolution** commit atomically in one `State` transaction; a wrong rowcount rolls everything back. Preserve existing `NULL history_id` protection rows and do not replace another protection owner. Resolve a post-arm, pre-effect refusal only on proof that no side effect occurred. Retain an active/manual guard for unverified outcomes, crash recovery or missing postconditions.
 
-**Compatibility caveat:** old R10 retention does not consult this fence table. `INSERT OR IGNORE` into `protected_images` is only a best-effort legacy belt, not independent image ownership. Older binaries must not run while unresolved G2 fences exist; `state_transition` and rollout/rollback checks must enforce this. Reuse of `compose_bootstrap_fences` is provisional: if existing consumers cannot safely accept typed evidence, a separately reviewed schema-10 claims table is required.
+All UPT deletion paths (`upt cleanup`, forced retention, `remove --images`, backup TTL) and mutation entrypoints (`restart`, `remove`, `convert`, `restore-compose`, CLI/web direct callers) must respect guards. Audit stable identity, redaction, claim enrichment, malformed records, active guards under CLI batch failures, and pruning of **only resolved G2 records**, preserving existing namespace/bootstrap retention.
 
-### P12 — Limited, explicit G3 overlap
+A minimal audited operator-only release must exist before any G2 writer is active. It verifies image/source/backup evidence, resolves only one proven guard and may publish corrective History solely from independently established facts; otherwise remains fenced. Unsupported operator attestation needs an explicit decision.
 
-S0 brings forward only durable CLI completion identity via the fence and the necessary audited release, image/backup retention and admission boundary. Broader CLI interruption journalling, recovery orchestration and a guided reconciliation tool remain G3 (#10). This proposal does not authorise either implementation.
+### P12 — Limited overlap with G3
+
+G2-S0 advances the minimum durable CLI completion identity, independent image/backup claims and audited release needed for G2 safety. Full G3 interruption journalling and guided reconciliation remain [issue #10](https://github.com/rdna897/upt/issues/10). Storage-independent **S0a** can be authorised independently of schema-10 design; S0b/S0c require further review and explicit owner approval.
 
 ## 5. Per-path application and manual reconciliation
 
