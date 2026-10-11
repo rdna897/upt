@@ -47,7 +47,7 @@ Each row names the mutation path, the completion write that makes its outcome du
   - `succeeded` — post-mutation verification passed: exact service identity, running, not unhealthy/starting as currently checked.
   - `uncertain` — a mutation command was issued but its result could not be observed, for example a recreate timed out or discovery failed afterwards.
 
-- **Workload completion point** — the line at which W becomes `succeeded`: immediately after the existing verification and before the completion write (`operations.py:355-357`, `:152-155`, `:423`, `:505-507`).
+- **Workload completion point** — the line at which W becomes `succeeded`: immediately after the existing verification and before the completion write (ordinary update `operations.py:355-357`, pinned update `:152-155`, CLI rollback `:423`, web rollback `:561-563`).
   Nothing after this point may change W.
 
 - **Publication outcome P** — one of:
@@ -69,12 +69,12 @@ Rows are the factual workload outcome W; columns are the publication outcome P. 
 | `not_started` | "Blocked — no changes made" (BLOCKED row) | "Blocked — no changes made; record not verified" | "Blocked — no changes made; record not verified" |
 | `failed` | "Failed", plus "automatic recovery succeeded" or "manual recovery required" as today | "Failed — record not verified; manual reconciliation required" | "Failed — record not verified; manual reconciliation required" |
 | `succeeded` | "Succeeded" | "Succeeded in Docker — History record unverified (may exist)" | "Succeeded in Docker — not recorded; rollback protection missing" |
-| `uncertain` | "Outcome unknown — manual recovery required" | "Outcome unknown — manual recovery required; record not verified" | "Outcome unknown — manual recovery required; record not verified" |
+| `uncertain` | Existing failure label for the path, plus "outcome uncertain" | Same, plus "record not verified; manual reconciliation required" | Same, plus "record not verified; manual reconciliation required" |
 
 For `not_started`, no Docker action is possible and the refusal is reported as today.
 For `failed`, the original workload error stays primary; the publication failure is attached to it and never substituted for it.
 For `succeeded`, the label is never FAILED, never "no changes made", and no compensation runs.
-For `uncertain`, the row is a FAILED row with `rollback_result="MANUAL RECOVERY REQUIRED"` and details `workload_outcome="uncertain"`; the existing guarded recovery rules apply unchanged.
+For `uncertain`, the row keeps each path's existing failure semantics (`result` and `rollback_result` exactly as written today) and adds details `workload_outcome="uncertain"`; G2 does not change recovery or labelling for genuine workload uncertainty beyond that key, and the existing guarded recovery rules apply unchanged.
 
 `not_attempted` occurs only for interruption (process killed), which is owned by G3 ([issue #10](https://github.com/rdna897/upt/issues/10)).
 
@@ -104,12 +104,13 @@ Web operations use their existing `operation_id` (already written into history `
 The key is stored in history `details` JSON as `completion_id` (web rows: equal to `operation_id`).
 Lookup is a bounded `history_for_service(stack, service)` scan filtered by `action` and parsed `details.completion_id`, the same pattern Compose apply uses today (`webservice.py:2625-2628`).
 There is no `json_extract` dependency, no new table and no unique index (that would be a schema change); uniqueness is guaranteed by a single writer per key under the existing lock.
+The CLI key exists only in process memory until the completion row commits; it deduplicates retries within one process but is not a durable pre-mutation intent (that is G3, [issue #10](https://github.com/rdna897/upt/issues/10)).
 
 ### P4 — Bounded attempts
 
 Maximum 3 attempts (the same as `COMPOSE_HISTORY_ATTEMPTS`), with back-off 0.2 s then 0.4 s.
 Retry only `sqlite3.OperationalError` (busy, locked, I/O, or cannot open).
-Do not retry `sqlite3.IntegrityError`, `ValueError` (for example namespace publication authorisation), `TypeError` or programming errors; these end publication immediately as `unavailable` with the error class recorded in logs.
+Do not retry `sqlite3.IntegrityError`, `ValueError` (for example namespace publication authorisation), `TypeError` or programming errors; these stop further attempts immediately and the error class is logged; P is then classified by the P5 reconciliation read (normally `unavailable`, because the failed transaction rolled back).
 Worst-case wall time is approximately 3 × 30 s SQLite busy timeout (`state.py:184`, `:195`) + 0.6 s, about 91 s; implementations must not exceed this bound.
 
 ### P5 — Ambiguous-commit reconciliation
@@ -119,7 +120,7 @@ Found means committed (use that id; never insert again).
 Read succeeded and absent means it is safe to retry.
 Read failed means, if attempts remain, retry with read-before-insert; otherwise P is `ambiguous`.
 Rationale: with one connection per transaction, once `commit()` returns or raises there is no later in-flight commit, so a successful read is definitive.
-If reconciliation finds a row for the key with a different `result` (a contradiction), do not write another row; report it and treat P as committed-with-contradiction for operator review.
+If reconciliation finds a row for the key with a different `result` (a contradiction), do not write another row: P is `committed` for idempotency purposes, and the contradiction is reported in the P7 log record and adapter result (`contradiction: true`) for operator review.
 
 ### P6 — Persistent unavailability
 
@@ -132,6 +133,8 @@ For W other than `succeeded`, the original workload exception remains the raised
 (a) Process log: one structured ERROR record on a dedicated logger (proposed `docker_update_manager.completion`) with completion key, action, service, W, P, old and new image ids, backup path, error class and a bounded (up to 200 chars) SQLite message; never environment content, credentials or registry auth.
 (b) CLI: a stderr message naming the service, W, P, the completion id, the running image id, the previous image id, and the instruction "do not run `upt cleanup` or retention for this service until reconciled"; exit status per open decision D1 (recommended `EXIT_FATAL` = 30).
 CLI completion paths must not leak raw `sqlite3` tracebacks.
+The automatic post-command retention and snapshot steps in `cli.py:531-532` must remain skipped when publication is incomplete (today they are skipped only because the exception propagates; S1 must preserve this deliberately).
+G2 adds no reconciliation command: "reconcile" means the operator verifies the running image against the reported identities and keeps the reported previous image and backup until a durable record exists. Whether a bounded reconciliation tool is in scope is open decision D8.
 (c) Web: the operation result carries `workload`, `publication`, `completion_id`, `manual_reconciliation_required: true` and a warning; terminal status per open decision D2 (recommended `succeeded` plus warning, matching the Compose apply precedent).
 If SQLite is wholly unavailable the web surface cannot read anything; the log record is then the authoritative evidence.
 
@@ -147,7 +150,7 @@ The web rollback fallback that writes `NO CHANGES MADE` may run only when the ad
 
 Protection is unchanged: every non-BLOCKED row with `old_image_id` protects it (`state.py:454-457`).
 Eligibility is unchanged (latest SUCCESS `update`, unexpired ref, backup present, `operations.py:387-393`) plus a new guard: rollback refuses when the selected row `new_image_id` is known and differs from the running service `image_id` ("History does not match the running image; reconcile first").
-This stops the R1 case where rollback silently targets an earlier point (characterisation test `test_current_behaviour_failed_success_write_makes_rollback_select_an_earlier_point`).
+This stops the R1 case where rollback silently targets an earlier point (characterisation test `test_current_behaviour_failed_success_write_makes_rollback_select_an_earlier_point`) and the R1b case where an unrecorded completed rollback leaves the superseded update selectable (`CliRollbackHistoryFailureCurrentBehaviour`).
 Never silently expire the sole usable rollback point; an operator-visible unreconciled completion must not be resolved by retention.
 Residual gap: when P is `unavailable` there is no `protected_images` row, so the previous image is protected only by operator action until G3 provides pre-mutation intent/protection; see D3.
 
@@ -162,35 +165,12 @@ Namespace update and Apply contracts are unchanged; do not route namespace publi
 | Path | Completion point | Key | Success publication | Failure-path publication | Removed behaviour |
 | --- | --- | --- | --- | --- | --- |
 | Ordinary update | `operations.py:357` | CLI uuid or web operation_id | SUCCESS with full new identity via the publisher; output "Updated …" only after committed | FAILED/BLOCKED via the publisher, original error primary | FAILED row after a successful workload |
-| Pinned update | `operations.py:155` | CLI uuid or web operation_id | SUCCESS with the new pin/digest via the publisher | FAILED/BLOCKED via the publisher; guarded genuine-failure recovery unchanged | Pin restore and recreate triggered by publication failure |
+| Pinned update | `operations.py:152-155` | CLI uuid or web operation_id | SUCCESS with the new pin/digest via the publisher | FAILED/BLOCKED via the publisher; guarded genuine-failure recovery unchanged | Pin restore and recreate triggered by publication failure |
 | `--pin` follow-on (`operations.py:361`) | Reuses the update completion | The update key | Runs only if the update publication is committed; otherwise skipped and reported | — | Pin attempted after an unrecorded update |
 | CLI rollback | `operations.py:423` | CLI uuid | ROLLED BACK via the publisher | No handler today; nothing added beyond P6 | Raw sqlite error escaping after a completed rollback |
-| Web rollback | `operations.py:507` | operation_id | ROLLED BACK via the publisher; adapter terminal per P8 | FAILED via the publisher; NO CHANGES MADE only with pre-boundary proof | Misreport as NO CHANGES MADE; success converted to failed on terminal-write failure |
+| Web rollback | `operations.py:561-563` | operation_id | ROLLED BACK via the publisher; adapter terminal per P8 | FAILED via the publisher; NO CHANGES MADE only with pre-boundary proof | Misreport as NO CHANGES MADE; success converted to failed on terminal-write failure |
 | Web update adapter | Reuses the update completion | operation_id | Maps `CompletionPublicationIncomplete` per P7/P8 instead of `failed` | Same mapping, original workload error primary | Web reports a successful update as failed |
 | Compose apply | `webservice.py:2622-2671` | operation_id | Moves onto the shared publisher (key = operation_id, behaviour preserved) | Same factual-outcome-plus-warning behaviour | Ad-hoc retry loop replaced; terminal write per P8 |
-
-**Ordinary update.** The completion point is `operations.py:357`, after verification and before the SUCCESS record.
-The key is the CLI uuid or the web `operation_id`.
-Success is published with the full new identity, and the "Updated …" output appears only after the row is committed.
-A workload failure still writes FAILED/BLOCKED through the publisher with the original error primary; the removed behaviour is the FAILED row previously written after a successful workload.
-
-**Pinned update.** The completion point is `operations.py:155`, and the key is shared with ordinary update.
-Publication succeeds with the new pin and digest.
-A genuine pre-completion-point failure keeps its guarded recovery, while the removed behaviour is the pin restore and previous-digest recreation that a publication failure used to trigger.
-
-**`--pin` follow-on.** The follow-on at `operations.py:361` runs only when the update publication is committed; otherwise it is skipped and reported, so a pin is never attempted after an unrecorded update.
-
-**CLI rollback.** The completion point is `operations.py:423` with a CLI uuid key.
-The ROLLED BACK row is written through the publisher; there is no workload handler today and none is added beyond P6.
-The removed behaviour is the raw sqlite error that could escape after a completed rollback.
-
-**Web rollback.** The completion point is `operations.py:507`, keyed by `operation_id`, with the adapter terminal state per P8.
-Failure-path publication writes FAILED through the publisher, and `NO CHANGES MADE` is allowed only with proof the mutation boundary was not crossed.
-The removed behaviours are the misreport as `NO CHANGES MADE` and the conversion of success to failed on a terminal-write failure.
-
-**Web update adapter.** The adapter maps `CompletionPublicationIncomplete` per P7/P8 instead of `failed`, keeping the original workload error primary; the removed behaviour is a web surface reporting a successful update as failed.
-
-**Compose apply.** The existing path moves onto the shared publisher with `key = operation_id`, preserving its factual-outcome-plus-warning behaviour; the ad-hoc retry loop is replaced and the terminal write follows P8.
 
 ## 6. Synthetic test plan
 
@@ -236,9 +216,11 @@ Production freeze stays in force; no deployment is implied by any slice.
 - **D3 — Residual protection gap** when no SQLite write succeeds.
   Recommended accept for G2 with P7 operator guidance and close it in G3 ([issue #10](https://github.com/rdna897/upt/issues/10)) via pre-mutation intent that also protects the previous image before the Docker boundary; alternative require a pre-Docker protection write inside G2 (the semantics of `protected_images` rows without a history id need separate design review) or a non-SQLite journal (a new persistence mechanism, separate review).
 - **D4 — Accept the rollback running-image match guard** (P9) as a behaviour change.
+  Side effects: a second rollback after a completed rollback is refused (the latest SUCCESS update no longer matches the running image), and so is rollback after an out-of-band image change; both now require operator reconciliation instead of proceeding.
 - **D5 — Retry bound** (3 attempts, up to about 91 s worst case under lock) acceptable, or lower the per-attempt busy timeout for completion writes.
 - **D6 — Namespace-update ambiguous commit:** characterise only in S4, or fix within G2.
 - **D7 — `do_pin`** (`operations.py:70`) and other single-write mutation records (pin, removal): include in G2-S4 or defer to Stage 5.
+- **D8 — Reconciliation tool:** recommended none in G2 (without durable intent there is nothing reliable to reconcile from once the process exits); provide one with G3. Alternative: a bounded, read-mostly `upt` reconciliation command in G2-S4 (separate design).
 
 ## 10. Risks
 
@@ -252,6 +234,6 @@ Production freeze stays in force; no deployment is implied by any slice.
 
 Before implementation: document each affected call path; a complete state/outcome matrix; no-database and ambiguous-commit behaviour; rollback-protection invariants; retry/reconciliation semantics; synthetic test plan; migration/compatibility impact; risks and open decisions. Obtain an independent ChatGPT review and explicit owner decision.
 
-Independent ChatGPT review of this PR must be recorded, owner decisions D1–D7 must be recorded in this file, and only then may G2-S1 start in a separate PR.
+Independent ChatGPT review of this PR must be recorded, owner decisions D1–D8 must be recorded in this file, and only then may G2-S1 start in a separate PR.
 
 **This draft authorises documentation and analysis only.** No `src/`, database/schema, CI-policy, live Docker or production changes. Do not merge the design PR without owner approval.
