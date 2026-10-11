@@ -301,23 +301,25 @@ class State:
         try:
             try:
                 c.execute("BEGIN IMMEDIATE")
+                handle = OwnedTransaction(c)
             except Exception as exc:
                 raise WriteOutcomeError(NOT_COMMITTED, "begin", exc) from exc
-            handle = OwnedTransaction(c)
             try:
                 yield handle
             except Exception as exc:
-                # Only a still-open transaction is provably discarded by rollback.
-                outcome = NOT_COMMITTED if c.in_transaction else AMBIGUOUS
+                bypassed = handle._release()
+                # Only the original, still-open transaction is provably discarded.
+                outcome = NOT_COMMITTED if c.in_transaction and not bypassed else AMBIGUOUS
                 self._quiet_rollback(c)
                 raise WriteOutcomeError(outcome, "body", exc) from exc
             except BaseException:
+                handle._release()
                 self._quiet_rollback(c)
                 raise
-            finally:
-                handle._release()
-            if not c.in_transaction:
-                # Ended without UPT's commit (e.g. SQLite automatic rollback).
+            if handle._release() or not c.in_transaction:
+                # Ended or replaced without UPT's commit (e.g. SQLite automatic
+                # rollback or an out-of-band COMMIT); discard any newer transaction.
+                self._quiet_rollback(c)
                 exc = RuntimeError("the owned SQLite transaction ended before commit")
                 raise WriteOutcomeError(AMBIGUOUS, "body", exc)
             try:

@@ -223,8 +223,65 @@ class TransactionOwnershipTests(_StateFixture):
         self.assertFalse(hasattr(c, "commit"))
         self.assertEqual(self.rows(), [("SUCCESS",)])
 
+    def test_results_expose_rows_and_metadata_only(self):
+        with self.state.write_transaction() as c:
+            inserted = c.execute("INSERT INTO history (stack,service,action,result) VALUES (?,?,?,?)",
+                                 ("stack", "app", "update", "SUCCESS"))
+            self.assertEqual((inserted.rowcount, inserted.lastrowid > 0), (1, True))
+            many = c.executemany("INSERT INTO history (stack,service,action,result) VALUES (?,?,?,?)",
+                                 [("stack", "app", "rollback", "ROLLED BACK")] * 2)
+            self.assertEqual(many.rowcount, 2)
+            query = "SELECT action FROM history ORDER BY id"
+            self.assertEqual(c.execute(query).fetchone()["action"], "update")
+            self.assertEqual(len(c.execute(query).fetchall()), 3)
+            self.assertEqual(len(c.execute(query).fetchmany(2)), 2)
+            self.assertEqual([row[0] for row in c.execute(query)], ["update", "rollback", "rollback"])
+            self.assertEqual(c.execute(query).description[0][0], "action")
+            for result in (inserted, many, c.execute(query)):
+                for name in ("connection", "execute", "executemany", "executescript", "close", "_real"):
+                    with self.subTest(name=name):
+                        self.assertFalse(hasattr(result, name))
+                        with self.assertRaises(TransactionOwnershipError):
+                            getattr(result, name)
+        with sqlite3.connect(self.state.db_path) as raw:
+            self.assertEqual(raw.execute("SELECT COUNT(*) FROM history").fetchone()[0], 3)
+
+    def test_cursor_connection_escape_is_refused(self):
+        self.assert_refused(lambda c: c.execute("SELECT 1").connection.commit())
+        self.assert_refused(lambda c: c.executemany("UPDATE history SET result=? WHERE id=-1", [("x",)]).connection.commit())
+        self.assert_refused(lambda c: c.execute("SELECT 1").execute("SELECT 1"))
+
+    def bypass(self, *, fail):
+        # Emulates any escape the handle cannot see: an out-of-band COMMIT, then a
+        # statement whose implicit BEGIN reopens a transaction (in_transaction=True).
+        with self.assertRaises(WriteOutcomeError) as caught:
+            with self.state.write_transaction() as c:
+                self.insert(c, result="SUCCESS")
+                c._connection.commit()
+                c._connection.execute("INSERT INTO history (stack,service,action,result,details) VALUES (?,?,?,?,?)",
+                                      ("stack", "app", "update", "SECOND", '{"completion_id":"%s"}' % KEY))
+                if fail:
+                    raise RuntimeError("body failed after the bypass")
+        return caught.exception
+
+    def test_early_commit_then_new_transaction_is_never_not_committed(self):
+        for fail in (True, False):
+            with self.subTest(body_fails=fail):
+                with sqlite3.connect(self.state.db_path) as raw:
+                    raw.execute("DELETE FROM history")
+                error = self.bypass(fail=fail)
+                self.assertEqual((error.outcome, error.phase), (AMBIGUOUS, "body"))
+                # The early commit is durable; the reopened transaction is discarded.
+                self.assertEqual(self.rows(), [("SUCCESS",)])
+
 
 class LegacyBehaviourTests(_StateFixture):
+    def test_connect_and_read_still_yield_raw_connections(self):
+        with self.state.connect() as c:
+            self.assertIsInstance(c.execute("SELECT 1"), sqlite3.Cursor)
+        with self.state.read() as c:
+            self.assertIsInstance(c.execute("SELECT 1"), sqlite3.Cursor)
+
     def test_connect_still_raises_raw_sqlite_errors(self):
         for mode, expected in (("before_commit", []), ("after_commit", [("SUCCESS",)])):
             with self.subTest(mode):

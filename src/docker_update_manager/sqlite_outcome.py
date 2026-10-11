@@ -119,20 +119,76 @@ def _leading_keyword(sql) -> str:
     return word.group(0).upper() if word else ""
 
 
+class OwnedResult:
+    """Result of one owned statement: rows and metadata only.
+
+    A raw ``sqlite3.Cursor`` exposes ``.connection`` and its own ``execute``,
+    either of which could commit or start a transaction outside
+    ``State.write_transaction``. This view exposes neither.
+    """
+
+    __slots__ = ("_cursor",)
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchmany(self, size=None):
+        return self._cursor.fetchmany() if size is None else self._cursor.fetchmany(size)
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._cursor)
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+    def __getattr__(self, name):
+        raise _UnavailableAttribute(f"{name!r} is not available on a State.write_transaction result")
+
+
 class OwnedTransaction:
     """The only view of a write connection lent to a transaction body.
 
     It exposes statement execution and nothing that can commit, roll back,
-    open a raw cursor or run an implicit-commit script. Each statement first
-    proves the owned transaction is still open, so Python's implicit ``BEGIN``
-    cannot silently start a second transaction after an automatic rollback.
+    open a raw cursor or run an implicit-commit script; results are
+    ``OwnedResult`` views. Each statement first proves the owned transaction
+    is still open, so Python's implicit ``BEGIN`` cannot silently start a
+    second transaction after an automatic rollback.
+
+    As a backstop against any escape this view cannot anticipate, SQLite's
+    trace callback records every transaction-control statement the connection
+    runs while the body owns it. The handle itself refuses such statements, so
+    any observed one proves ownership was bypassed; ``_release`` reports it.
     """
 
-    __slots__ = ("_connection", "_open")
+    __slots__ = ("_connection", "_open", "_bypassed")
 
     def __init__(self, connection):
         self._connection = connection
         self._open = True
+        self._bypassed = False
+        connection.set_trace_callback(self._observe)
+
+    def _observe(self, statement):
+        if _leading_keyword(statement) in _TRANSACTION_CONTROL:
+            self._bypassed = True
 
     def _checked(self, sql):
         if not self._open:
@@ -144,18 +200,22 @@ class OwnedTransaction:
 
     def execute(self, sql, parameters=()):
         self._checked(sql)
-        return self._connection.execute(sql, parameters)
+        return OwnedResult(self._connection.execute(sql, parameters))
 
     def executemany(self, sql, parameters):
         self._checked(sql)
-        return self._connection.executemany(sql, parameters)
+        return OwnedResult(self._connection.executemany(sql, parameters))
 
     @property
     def in_transaction(self):
         return self._open and self._connection.in_transaction
 
     def _release(self):
-        self._open = False
+        """End the loan before UPT's own rollback/commit; True if ownership was bypassed."""
+        if self._open:
+            self._open = False
+            self._connection.set_trace_callback(None)
+        return self._bypassed
 
     def __getattr__(self, name):
         raise _UnavailableAttribute(f"{name!r} is not available inside State.write_transaction")
