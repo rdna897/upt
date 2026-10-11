@@ -4,6 +4,7 @@
 **Tracking:** [issue #9](https://github.com/rdna897/upt/issues/9) (S6-R1, R1b, R2, R3).
 **Prerequisites:** [Stage 6a transaction-ownership decision](stage6-sqlite-state-ownership-review.md); merged [G2 characterisation PR #13](https://github.com/rdna897/upt/pull/13); merged [R10 PR #14](https://github.com/rdna897/upt/pull/14).
 **Deployment:** Production freeze remains in force. No Docker changes or live databases in development/tests.
+**S0 foundation:** [operation-scoped recovery-fence proposal](g2-s0-recovery-fence-design.md) (ChatGPT-authored for independent Opus critique; not approved). It supersedes the earlier P11 `protected_images` upsert proposal.
 
 ## Problem and required contract
 
@@ -37,7 +38,7 @@ The proposal must specify, per mutation path:
 - (c) `State.record` writes the history row, `protected_images` and `rollback_refs` in one transaction (`state.py:442-458`); today protection exists only if the completion row commits.
 - (d) Retention treats a `protected_images` row with no matching rollback ref (including a NULL `history_id`) as **unresolved** and refuses removal, even under `--override-protection` (`src/docker_update_manager/retention.py:19-31`, `:137-144`, merged in R10 #14). Retention deletes only resolved protection rows (`retention.py:312`, `:325`).
 - (e) `recover_abandoned_operations` (`state.py:777-866`) marks every stale active web update/rollback `failed` with "Agent stopped while this update was active" (`state.py:810-811`) without consulting History or any durable boundary marker. Only namespace update and Compose apply have durable markers.
-- (f) Compose backups (`backups/<stamp>`, `compose.py:125`) expire by age only (`retention.py:49-61`, default 7 days), whether or not a history row references them. This is pre-existing and applies equally to committed rollback points.
+- (f) Compose backups (`backups/<stamp>`, `compose.py:125`) currently expire by age only (`retention.py:49-61`, default 7 days), even if History references them. S0 must explicitly exempt every backup claimed by a pending/unresolved completion guard, including forced cleanup, instead of treating this as acceptable for unverified completions.
 - (g) `State.connect` (`state.py:263-274`) does not tell its caller whether an exception arose before `commit()` (rolled back, definitely not committed) or from `commit()` (outcome unknown). Every connection uses a fixed 30 s timeout and busy timeout (`state.py:184`, `:195`).
 - (h) The operation status vocabulary is `queued / running / finalizing / succeeded / failed / blocked` (`state.py:136`, `:802-805`). It has no status for "outcome not established". The `status` column has no CHECK constraint (`state.py:72-78`), but `webapp.py`, `operation_presentation.py` and `static/operation.js` interpret the vocabulary.
 
@@ -56,7 +57,7 @@ The proposal must specify, per mutation path:
   - `ambiguous`: a commit may have happened and absence could not be established before the deadline;
   - `contradictory`: a row with the key exists but its factual fields differ, or more than one row has the key. This is **never** successful publication.
 - **Terminal publication**: the web `finish_operation` write, kept distinct from history publication.
-- **Recovery evidence**: the previous image (protected by `protected_images`), the Compose backup directory, the web pre-rollback recovery backup, and the completion marker (P11).
+- **Recovery evidence**: the previous image and all distinct owners of its protection (legacy `protected_images` / `rollback_refs` plus the independent operation guard in P11), the exact Compose recovery backup, web pre-rollback backup, and durable operation identity.
 
 ## 3. Outcome and publication matrix
 
@@ -83,7 +84,7 @@ One core helper (proposed `src/docker_update_manager/completion.py`; the name is
 
 ### P3 — Completion key
 
-A 32-hex `completion_id` is fixed before the mutation boundary: web operations use their `operation_id` and CLI operations generate a uuid4 hex. It is stored in history `details.completion_id` and in the P11 marker. Lookup is a bounded `history_for_service(stack, service)` scan filtered by `action` and parsed `details.completion_id`, the pattern Compose apply already uses (`webservice.py:2625-2628`). There is no `json_extract` dependency. A unique index is **not** added in G2 (schema change): duplicate prevention relies on the P5 invariant, not on database uniqueness.
+A 32-hex `completion_id` is fixed before the mutation boundary: web operations use their `operation_id` and CLI operations generate a uuid4 hex. It is stored in history `details.completion_id` and in the independent P11 operation-scoped guard. P11 also requires a durable **pre-mutation operation row for CLI**, a deliberately bounded G3 foundation. Lookup is a bounded `history_for_service(stack, service)` scan filtered by `action` and parsed `details.completion_id`, the pattern Compose apply already uses (`webservice.py:2625-2628`). There is no `json_extract` dependency. No uniqueness index is proposed here; P5 and update-lock single-writer semantics require explicit verification, not assumption.
 
 ### P4 — One monotonic completion deadline
 
@@ -120,7 +121,7 @@ When P is not `committed` after the deadline, the publisher stops. There is no F
 ### P7 — Operator visibility independent of SQLite
 
 - (a) **Log.** One structured ERROR record on a dedicated logger (proposed `docker_update_manager.completion`) with key, action, service, W, P, old/new image ids, backup path, error class and a SQLite message bounded to 200 characters. It never contains environment content, credentials or registry auth. When nothing is durable, this record is the authoritative evidence.
-- (b) **CLI.** A stderr message stating the factual workload outcome and, separately, that publication was not verified, with the completion id, running and previous image ids, backup path, and a pointer to the manual procedure (section 5). Exit status **30** (D1). No raw `sqlite3` traceback. The automatic post-command snapshot and retention (`cli.py:531-532`) stay skipped; today that happens only because the exception propagates, and S1 must preserve it deliberately.
+- (b) **CLI.** A stderr message stating the factual workload outcome and, separately, that publication was not verified, with the completion id, running and previous image ids, backup path, and a pointer to the manual procedure (section 5). Exit status **30** (D1). No raw `sqlite3` traceback. The automatic post-command snapshot and retention (`cli.py:531-532`) stay skipped when publication is unverified; S1 must preserve this explicitly. The durable P11 guard separately blocks normal and forced UPT cleanup regardless of the operator warning.
 - (c) **Web.** See P8. A warning alone is never the protection mechanism; protection is P11.
 
 ### P8 — Web terminal publication and post-restart recovery (fail-closed)
@@ -133,14 +134,14 @@ Three cases are distinct:
    - W = `uncertain`: today's terminal mapping (`failed` with manual recovery required) is kept unless the D9 decision extends `unresolved` to in-process uncertain outcomes.
 2. **Terminal publication fails** (deadline exhausted). The adapter never falls through to `finish_operation(failed)` or a failure audit. The operation stays active in the database, the P7 log record is written, and the worker exits normally, releasing the lock.
 3. **Post-restart / post-worker reconciliation** (`recover_abandoned_operations`, which already requires the update lock as its liveness proof). For a stale update/rollback operation:
-   - **No marker** and the operation was created by a P11-aware binary (`summary.completion_protocol >= 1`) → the boundary was provably not crossed → `blocked`, "no changes were made".
-   - **No marker** on a legacy operation → today's behaviour is retained (`failed`, "check the container and History"), because absence proves nothing.
-   - **Marker present** and exactly one matching committed history row (same completion key and `old_image_id` as the marker) → the terminal status the in-process adapter would have published for that row under case 1, with the warning "terminal state recovered after interruption".
-   - **Marker present** and no row, a contradictory row, or reads that fail → **unresolved**. `mutation_performed: null`, `outcome_verified: false`, `manual_reconciliation_required: true`. Never `succeeded` or `failed`.
-   - **Never replay.** Recovery issues no Docker or Compose command and does not restore sources. The marker, the pending protection row and the backups are retained.
+   - **No committed guard** and the operation was created by a P11-aware binary (`summary.completion_protocol >= 1` recorded at operation creation, independently of guard insertion) → the boundary was never authorised → `blocked`, "no changes were made", subject to proving no effect path bypasses P11.
+   - **No guard** on a legacy operation → today's behaviour is retained (`failed`, "check the container and History"), because absence proves nothing.
+   - **Guard present** and exactly one matching committed history row (same completion key and `old_image_id` as the guard) → the terminal status the in-process adapter would have published for that row under case 1, with the warning "terminal state recovered after interruption".
+   - **Guard present** and no row, a contradictory row, or reads that fail → **unresolved**. `mutation_performed: null`, `outcome_verified: false`, `manual_reconciliation_required: true`. Never `succeeded` or `failed`.
+   - **Never replay.** Recovery issues no Docker or Compose command and does not restore sources. The operation-scoped guard, every independently owned image protection, and all guarded backup paths are retained.
    - If the database is unavailable at restart, recovery cannot run and the operation stays active; the API reports the database error rather than a status. The contract applies once the database is readable again.
 
-The web rollback `NO CHANGES MADE` fallback (`webservice.py:2147-2165`) may run only when the adapter can prove the boundary was not crossed: no marker committed, and the in-memory boundary flag false.
+The web rollback `NO CHANGES MADE` fallback (`webservice.py:2147-2165`) may run only when the adapter can prove the boundary was not crossed: a new-protocol operation has no committed guard, and the in-memory boundary flag is false.
 
 **Status vocabulary (D9).** The current vocabulary cannot express "unresolved" without misusing `failed`. The recommended option is a new terminal status `unresolved` (an API/UI contract change, no schema change); see D9 for the alternatives and the required compatibility review. Until D9 is decided, no G2 slice may write an unverified outcome as `succeeded` or `failed`; slices that need it (S1, S3, S4) are blocked on D9.
 
@@ -152,26 +153,19 @@ Protection rules are unchanged except for P11. Eligibility (`operations.py:387-3
 
 No SQLite transaction spans Docker/Compose effects or sleeps. History and its protection stay one transaction (`State.record`). Core/web separation, locks, schema 9 and the namespace update/Apply contracts are unchanged; namespace publication is not routed through the new helper without separate approval.
 
-### P11 — Pre-mutation completion marker and enforceable protection (resolves D3)
+### P11 — Independent operation-scoped completion guard (revised D3)
 
-Immediately before the mutation boundary, in one short `State` transaction:
+**The prior proposal to upsert a `protected_images(image_id, history_id=NULL)` row is withdrawn.** The current table has a one-image primary key, so replacing it could silently erase an unrelated namespace/manual-recovery owner; `State.record()` could then replace the pending row. Multiple operations may share an image. The [S0 fence design](g2-s0-recovery-fence-design.md) specifies the replacement architecture and required tests.
 
-1. Upsert `protected_images(image_id=<image to be replaced>, reason='pending completion <completion_id>', history_id=NULL)`. For updates this is the current `old_image_id`; for rollback it is the currently running image.
-2. Web operations only: set `summary.completion_marker = {completion_id, old_image_id, backup}` and `summary.completion_protocol = 1` on the active `operation_runs` row. This mirrors `mark_compose_mutation_started` (`state.py:1602-1611`).
+Proposed **schema-9 first**: an operation-scoped, versioned `completion_guard` in the existing `operation_runs.summary` for web and newly journalled CLI mutation operations, uniquely identified by `completion_id`; each claim names exact service identity, the old image, the exact backup path and `pending/unresolved/resolved` lifecycle. Creation of a new-protocol operation must commit `completion_protocol=1` separately before the guard. The guard is committed before any Docker/image/source mutation, or the operation is refused. An ambiguous guard commit must be *proven present* before mutation is allowed. No G2 operation overwrites an independent `protected_images` owner.
 
-Rules:
+The same query must make every image-removal path, backup-retention path and interfering service mutation **fail closed** while a pending or unresolved guard exists. In particular, it must cover `upt cleanup`, automatic and forced retention, age-based `backups/` cleanup and relevant CLI/web mutation front doors. Image + backup protection must persist despite process termination, web `unresolved` being terminal for UI, a failed guard-release write, or another service sharing an image. A history/terminal completion may resolve only **its own** guard after durable correlated evidence; unknown/contradictory state retains the guard. An existing manual/NULL-history ownership conflict must refuse mutation or be handled by a separately approved multi-owner mechanism; normal `State.record` may not silently erase it.
 
-- **Fail closed.** If the marker cannot be committed (P5 tree, with its own budget under the P4 mechanism; recommended 30 s), the mutation is refused before the boundary: W = `not_started`, nothing changed.
-- **Upsert, not insert-or-ignore.** An existing history-linked row for the same image could later be resolved and deleted by retention while this completion is unverified. Replacing it with the pending, history-less row keeps the image unresolved-protected. On a committed completion row, `State.record` replaces the pending row with the normal history-linked protection (`state.py:454-457`), exactly as today. The only lifecycle change is the interval between the marker and the completion.
-- **Enforcement.** `upt cleanup` excludes every `protected_images` image (`cli.py:420`). Retention refuses removal of any image with an unresolved (NULL-history) protection, even under `--override-protection` (`retention.py:28-31`, `:142-143`). So a failed or ambiguous completion leaves the previous image protected by existing, already-reviewed mechanisms rather than by a warning.
-- **Release.** No G2 path deletes a pending row except its replacement by the completion's own committed row. Clearing an orphaned pending row is the manual procedure (section 5), until G3 provides a reviewed tool (D8). The cost of failing closed is retained disk space, never lost recovery evidence.
-- **Precedent.** `mark_namespace_update` already commits `INSERT OR IGNORE INTO protected_images(image_id,reason)` with a NULL history id before Compose (`state.py:1094-1095`). P11 differs in using an upsert, for the reason above.
-- **Compatibility limit.** Pre-R10 binaries deleted protection rows by image when removing expired images (removed in `9aca400`). The guarantee therefore holds only for binaries that include R10 (#14). Rolling back below R10 while pending rows exist is unsupported (D3b).
-- **Backups.** Compose backup expiry by age (Related surface f) is pre-existing and not caused by publication failure. Retaining the backup of an unverified completion is optional decision D3c.
+**Compatibility:** `operation_runs` reuse requires evidence for CLI identity/lifecycle, bounded JSON, recovery, pruning and older rows. If it cannot satisfy the invariant safely, stop and seek approval for a dedicated schema migration rather than inventing an unsafe reuse. Old binaries, even R10 binaries, do not understand these guards; downgrade while unresolved guards exist is unsupported. No new G2 source work may begin until this owner decision is approved.
 
-### P12 — Sequencing with G3
+### P12 — Bounded G3 prerequisite
 
-G3's durable CLI intent journal and interruption recovery (#10) is **not** a prerequisite for G2. P11 (slice G2-S0) is the smallest independently reviewable fail-closed safeguard: it reuses schema-9 constructs that existing retention and cleanup already enforce, and it is a **prerequisite for S1–S3**. G3 later supplies the durable CLI intent record, interruption recovery for CLI operations, and the reviewed reconciliation tool. P11 markers are designed to be read by G3 without migration.
+G2-S0 explicitly implements the **minimum G3 durable-intent foundation needed to make G2 safe**: a per-operation durable identity, a persisted image-and-backup guard and fail-closed admission/retention. Full CLI crash outcome reconciliation, rich journalling and a supported reconciliation tool remain G3 (#10). This is a sequencing dependency, not approval for a broad Stage 5 extraction. D9 controls the web terminal vocabulary separately.
 
 ## 5. Per-path application and manual reconciliation
 
@@ -190,9 +184,9 @@ G3's durable CLI intent journal and interruption recovery (#10) is **not** a pre
 1. Take the completion id, service and image ids from the CLI message, the web result or the `docker_update_manager.completion` log.
 2. Inspect the running container's image id (`docker inspect`) and compare it with the reported old and new ids.
 3. Check History for a row with that `completion_id` (`upt history`).
-4. Do not run `upt cleanup`, forced retention or manual image removal for the previous image until reconciled. P11 already blocks UPT's own removal paths.
+4. Do not run `upt cleanup`, forced retention or manual image removal for the previous image until reconciled. P11 must block UPT's own removal paths for both the image and its backup.
 5. Do not re-run the update or rollback to "repair" the record; P9 refuses an inconsistent rollback.
-6. Release of the pending protection row or creation of a corrective History record needs a reviewed tool (G3). Until then, leave the row in place. Direct database edits are outside the supported procedure.
+6. Release of an unresolved operation guard or creation of a corrective History record needs a reviewed tool (G3). Until then, leave the guard and every independently owned protection in place. Direct database edits are outside the supported procedure.
 
 ## 6. Synthetic test plan
 
@@ -209,9 +203,9 @@ For each of ordinary update, pinned update, CLI rollback, web rollback and the w
 7. `unavailable` → as 6, plus CLI exit 30 with the stderr contract and no traceback.
 8. Deadline: fake clock asserts total elapsed time ≤ budget across writes, reads and back-off, and no SQLite step starts after the deadline.
 9. Failure-path row under unavailability → the original workload error stays primary.
-10. P11: a marker-write failure refuses before any Docker call (W = `not_started`). After an unverified completion the previous image is in `state.protected()`, `upt cleanup` candidate filtering excludes it, and retention reports "SKIPPED - UNRESOLVED PROTECTION" even with override. A committed completion replaces the pending row with the history-linked row.
-11. P11 upsert: an existing history-linked protection for the same image is replaced by the pending row, so expiring the older ref does not make the image removable.
-12. Web P8: a `terminal_operation_update("succeeded")` fault is never converted to failed. Recovery with marker plus committed row → terminal from the row; marker and no row → unresolved; no marker with `completion_protocol=1` → blocked; legacy operation without marker → today's behaviour; no Docker call in any recovery case.
+10. P11: operation creation/guard-write failure refuses before any Docker call (W = `not_started`); a committed operation-scoped guard prevents every UPT image-removal and backup-expiry path, including forced overrides, while preserving existing `state.protected()` rows. An independent protection remains intact before and after a legitimate committed History write. A matching successful completion releases only its own guard.
+11. P11 ownership: two guards sharing one image remain independent; releasing one never releases the other. An existing `NULL history_id` namespace/manual-recovery row survives byte-for-byte; attempting to overwrite that owner fails closed. A stale/active guard prevents mutation admission on the same service/image and cannot be erased by `prune_operations`.
+12. Web P8: a `terminal_operation_update("succeeded")` fault is never converted to failed. Recovery with guard plus committed row → terminal from the row; guard and no row → unresolved; **protocol capability recorded on creation** plus no guard → blocked; legacy operation without capability → today's behaviour. Guarded image and backup survive recovery; no Docker call occurs in any recovery case. Also test interruption between History and guard release.
 13. P9: a mismatched `new_image_id` refuses; a matching row still rolls back.
 
 Each slice replaces the matching characterisation tests in `tests/test_sqlite_completion_characterisation.py` with explicit replacement tests in the same PR. Genuine workload-failure recovery tests (including `pre_recovery_check` refusal and operator-edit protection) must remain and pass.
@@ -220,7 +214,7 @@ Each slice replaces the matching characterisation tests in `tests/test_sqlite_co
 
 Separately reviewed PRs, each independently revertible, none merged without owner approval:
 
-- **G2-S0 (prerequisite):** P11 marker and pending protection for ordinary update, pinned update and both rollbacks; `State` before/after-commit classification and per-call timeout (P4/P5 primitives); harness extensions. No change to completion behaviour yet.
+- **G2-S0 (prerequisite; bounded G3 foundation):** per-operation durable guard with CLI/web identity, independent image and backup ownership; guarded cleanup/retention and mutation-admission checks; crash/prune/downgrade-safe lifecycle; `State` before/after-commit classification and per-call timeout (P4/P5 primitives); synthetic harness extensions. No change to success/failure completion reporting yet. **S0 is blocked on approval of the guard storage/compatibility contract**; no unsafe `protected_images` upsert.
 - **G2-S1 (R1):** shared publisher, deadline, typed exception, completion logger, ordinary update, web update adapter (P8 cases 1–2), CLI surface. Needs S0 and D9.
 - **G2-S2 (R2):** pinned update; remove database-triggered compensation; `--pin` gating. Needs S0 and S1.
 - **G2-S3 (R1b):** CLI and web rollback; web fallback gating; P9 guard. Needs S0, S1 and D9.
@@ -230,9 +224,9 @@ Separately reviewed PRs, each independently revertible, none merged without owne
 
 - No schema migration; `CORE_SCHEMA_VERSION` stays 9 (`state.py:119`).
 - Additive `details` and operation `summary`/`result` keys only. CLI success rows gain JSON `details` (previously none); S1 must verify that every History reader tolerates this.
-- Pending protection rows (P11) are honoured by deployed R10+ retention and by every version of `upt cleanup`. Downgrading below R10 while pending rows exist is unsupported (D3b).
+- Existing binaries (including R10) do **not** understand the proposed operation-scoped P11 guards. Downgrade/partial deployment with unresolved guards is unsupported (D3b), and a verified deployment/rollback gate is required before release. S0 must update all relevant cleanup/admission/retention paths together.
 - The `unresolved` operation status (if D9 is approved) requires `webapp.py`, `operation_presentation.py`, `static/operation.js`, SSE terminal detection and API clients to be updated together. Older web binaries' handling of an unknown status must be assessed before adoption.
-- Per-slice rollback is a binary revert, within the R10 floor. The production freeze stays in force; no slice implies deployment.
+- Per-slice rollback is permitted only when the guard compatibility gate proves no unresolved new-protocol guards remain; otherwise binary revert is unsafe. The production freeze stays in force; no slice implies deployment.
 
 ## 9. Decision register
 
@@ -242,38 +236,40 @@ Provisional direction is as recorded from the owner's review instructions (2026-
 | --- | --- | --- | --- |
 | D1 | CLI exit status for factual success with unverified publication | 30 (`EXIT_FATAL`), with separate factual-success and publication-failure messages | Confirmation |
 | D2 | Web terminal status | `succeeded` with warning **only** when History is durably committed; otherwise unresolved | Confirmation; depends on D9 |
-| D3 | Enforceable rollback protection and G2/G3 sequencing | Require enforceable protection: P11 in G2-S0 as a prerequisite for S1–S3; G3 not a prerequisite (P12) | Confirmation of P11 and the S0 sequencing |
-| D3b | Binary rollback floor | Do not support downgrade below R10 (#14) while pending protection rows exist | Separate decision |
-| D3c | Retain the Compose backup of an unverified completion beyond age expiry | Recommended: defer to G3; age expiry is pre-existing and equal for committed points | Separate decision |
+| D3 | Enforceable image/backup protection and G2/G3 sequencing | Adopt a durable operation-scoped guard, independent of the one-row-per-image `protected_images` table; S0 advances the minimum G3 intent foundation, with full CLI recovery in G3 | Approve S0 ownership, retention and admission contracts; review `operation_runs` suitability |
+| D3b | Binary downgrade/partial-upgrade floor | Do not run older binaries that lack P11 guard enforcement while any unresolved guard exists; R10 alone is insufficient | Separate compatibility and rollout decision |
+| D3c | Retain the exact backup of an unresolved completion past age expiry | **Required for S0**; skip guarded backups in inventory, real/forced retention and final delete revalidation; other backups retain normal TTL | Confirm path/ownership and safe-downgrade contract |
 | D4 | Rollback running-image identity guard (P9) | Accept, fail closed. Side effects: a second rollback after a completed rollback, and rollback after an out-of-band image change, are refused pending reconciliation | Confirmation |
 | D5 | Retry bound | One monotonic completion deadline (P4); recommended 60 s | Confirmation of the budget value |
 | D6 | Namespace-update ambiguous commit | Characterise first (tests only, S4); any fix is a separate decision | Confirmation |
 | D7 | Unrelated single-write mutation records (`do_pin` at `operations.py:70`, removal, others) | Defer with explicit tracking; open a tracking issue before S1 merges | Tracking issue creation |
 | D8 | Reconciliation tool | Defer the automated tool to G3; the section 5 manual procedure is the interim | Confirmation |
-| D9 | Status vocabulary for unverified outcomes | Recommended: new terminal operation status `unresolved` (no schema change; API/UI contract change), used for an unverified succeeded publication and for marker-present interrupted operations. Sub-decision: whether also to use it for in-process `uncertain` outcomes, which today are `failed` with manual recovery. Alternatives: (b) `failed` with `outcome_verified:false`, which misuses a definitive status and conflicts with P8; (c) leave the operation non-terminal, which falsely shows it as in progress and keeps streams open | **Separate compatibility decision**, after assessing UI/API consumers and older web binaries; blocks S1, S3 and S4 |
+| D9 | Status vocabulary for unverified outcomes | Recommended: new terminal operation status `unresolved` (API/UI contract change), used for unverified succeeded publication and for guard-present interrupted operations. Consider in-process uncertain outcomes separately | **Separate compatibility decision**, including SSE, polling and old web binaries; blocks S1, S3 and S4 |
+| D10 | Storage and admission model for operation guards | Prefer existing core `operation_runs` + versioned summary for CLI/web, without overriding `protected_images`; if lifecycle is unsuitable, request approval for narrowly scoped schema migration | Architectural review of G2-S0 fence proposal; blocks S0 |
 
 ## 10. Risks
 
 - Lock hold under contention is bounded by the P4 deadline (recommended 60 s) plus at most one non-interruptible in-flight statement.
 - Without a unique index, duplicate prevention depends on the P5 invariant and on single-writer-per-key under the update lock and per-operation worker.
-- P11 retains images whose completion stays unverified until manual or G3 reconciliation: disk cost by design.
-- The P11 upsert re-links protection for a shared image id earlier than today (at the marker rather than at completion); the end state after a committed completion is unchanged.
-- D9 touches the web wire contract.
-- Backup age expiry for unverified completions (D3c).
+- P11 retains image, backup and durable completion evidence until verified or manual/G3 reconciliation: disk cost by design.
+- Operation-scoped guards require every deletion and admission path to consult durable state; an incomplete rollout must fail closed, not silently trust old `protected_images` semantics.
+- D9 touches the web wire contract and requires an explicit terminal/polling compatibility gate.
+- CLI use of core `operation_runs` requires lifecycle and pruning review; schema-9 suitability is not assumed.
 
 ## 11. Review history
 
 - **Opus review of the first draft** (commit `eb3bd3b`): corrected citations, the scope of the uncertain outcome, and the reconciliation gaps.
-- **Independent ChatGPT architecture review of `eb3bd3b`:** two High and two Medium findings, all accepted after checking against the code:
+- **Independent ChatGPT architecture review of `eb3bd3b`:** two High and two Medium findings, accepted after checking against the code:
   - (H1) P8 could not reconstruct an outcome from absent History → P8 rewritten as a fail-closed three-case contract with durable markers and an unresolved status (D9);
   - (H2) no durable protection when nothing commits → P11 pre-mutation marker with pending protection, enforced by existing cleanup/retention, sequenced as G2-S0 (P12);
   - (M3) retry after an ambiguous commit with a failed read could duplicate → P5 invariant and decision tree, `contradictory` outcome, tests 3–5;
   - (M4) the deadline bounded writes only → P4 single monotonic deadline covering every completion-side step.
+- **Independent review of `84d5170` (follow-up):** identified three remaining High risks in the P11 upsert (existing manual ownership erased), age-only backup expiry, and absent mutation admission fence; plus a Medium protocol-capability/guard-creation ordering inconsistency. The [S0 operation-scoped fence proposal](g2-s0-recovery-fence-design.md) replaces P11's upsert and moves backup retention/admission and minimal CLI durable intent into S0. These remain **proposals pending independent Opus critique and owner decisions**, not approved code.
 
 ## 12. Design acceptance gate
 
 Before implementation: document each affected call path; a complete state/outcome matrix; no-database and ambiguous-commit behaviour; rollback-protection invariants; retry/reconciliation semantics; synthetic test plan; migration/compatibility impact; risks and open decisions. Obtain an independent ChatGPT review and explicit owner decision.
 
-The independent ChatGPT review of this revision must be recorded, and owner decisions D1–D9 (including D3b and D3c) must be recorded in this file. Only then may G2-S0 start in a separate PR. S1–S4 additionally depend on the prerequisites listed in section 7.
+The independent ChatGPT review of this revised S0 boundary must be recorded, and owner decisions D1–D10 (including D3b and D3c) must be approved in this file. Only then may G2-S0 start in a separate PR. Pending status/ownership decisions are not implementation authorisation. S1–S4 additionally depend on the prerequisites listed in section 7.
 
 **This draft authorises documentation and analysis only.** No `src/`, database/schema, CI-policy, live Docker or production changes. Do not merge the design PR without owner approval.
