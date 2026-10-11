@@ -104,6 +104,7 @@ RULES: tuple[tuple[str, Suite], ...] = (
     # Shared orchestration, state, security and recovery: always full.
     (SRC + "state.py", _full("persistent state and history")),
     (SRC + "state_transition.py", _full("persistent state transitions")),
+    (SRC + "sqlite_outcome.py", _full("persistent state transaction outcome primitives")),
     (SRC + "lock.py", _full("exclusive operation locking")),
     (SRC + "auth.py", _full("authentication")),
     (SRC + "webstate.py", _full("web sessions and authorisation state")),

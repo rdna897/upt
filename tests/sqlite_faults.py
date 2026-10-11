@@ -12,6 +12,13 @@ production SQLite failure would surface, without replacing ``State`` methods:
   commits, then the commit acknowledgement raises (an ambiguous commit).
 * ``unavailable`` - the matching statement raises and, from then on, every new
   connection fails until the context exits (persistent unavailability).
+* ``read_failure`` - the matching statement (normally a ``SELECT`` chosen with
+  ``select_from``) raises without persisting anything: a failed
+  reconciliation read. ``times`` bounds how many reads fail.
+
+Every connection's requested per-call timeout is recorded in
+``fault.connection_timeouts`` (``None`` means the 30 s default), so tests can
+prove a deadline reached each SQLite step.
 
 Statements are matched by a predicate over ``(sql, row)``, where ``row`` maps
 the column names of an ``INSERT`` to its parameters (``{"params": ...}`` for
@@ -37,6 +44,15 @@ def history_insert(**expected):
         if "unmapped" in row:
             raise AssertionError("history_insert supports placeholder-only INSERTs: " + sql[:80])
         return all(row.get(key) == value for key, value in expected.items())
+    return match
+
+
+def select_from(table):
+    """Match a ``SELECT`` whose first ``FROM`` names ``table``."""
+    pattern = re.compile(r"\s*SELECT\b.*?\bFROM\s+" + re.escape(table) + r"\b", re.IGNORECASE | re.DOTALL)
+
+    def match(sql, row):
+        return bool(pattern.match(sql))
     return match
 
 
@@ -85,7 +101,7 @@ class _Connection:
 
 class SqliteFault:
     def __init__(self, match, mode, times, message):
-        if mode not in {"before_commit", "after_commit", "unavailable"}:
+        if mode not in {"before_commit", "after_commit", "unavailable", "read_failure"}:
             raise ValueError(mode)
         self.match = match
         self.mode = mode
@@ -93,6 +109,7 @@ class SqliteFault:
         self.message = message
         self.hits = []
         self.unavailable = False
+        self.connection_timeouts = []
 
 
 @contextmanager
@@ -105,13 +122,15 @@ def sqlite_fault(state, match, *, mode="before_commit", times=1, message=None):
     fault = SqliteFault(match, mode, times, message or {
         "before_commit": "database is locked",
         "after_commit": "disk I/O error",
-        "unavailable": "unable to open database file"}[mode])
+        "unavailable": "unable to open database file",
+        "read_failure": "disk I/O error"}[mode])
     original = state._new_connection
 
-    def new_connection():
+    def new_connection(timeout=None):
+        fault.connection_timeouts.append(timeout)
         if fault.unavailable:
             raise sqlite3.OperationalError(fault.message)
-        return _Connection(original(), fault)
+        return _Connection(original(timeout=timeout), fault)
 
     with patch.object(state, "_new_connection", side_effect=new_connection):
         yield fault
