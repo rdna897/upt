@@ -4,7 +4,7 @@
 **Tracking:** [issue #9](https://github.com/rdna897/upt/issues/9) (S6-R1, R1b, R2, R3).
 **Prerequisites:** [Stage 6a transaction-ownership decision](stage6-sqlite-state-ownership-review.md); merged [G2 characterisation PR #13](https://github.com/rdna897/upt/pull/13); merged [R10 PR #14](https://github.com/rdna897/upt/pull/14).
 **Deployment:** Production freeze remains in force. No Docker changes or live databases in development/tests.
-**S0 foundation:** [operation-scoped recovery-fence proposal](g2-s0-recovery-fence-design.md) (ChatGPT-authored for independent Opus critique; not approved). It supersedes the earlier P11 `protected_images` upsert proposal.
+**S0 foundation:** [operation-scoped recovery-fence proposal](g2-s0-recovery-fence-design.md) (proposed for independent architectural review; not approved). It supersedes the earlier P11 `protected_images` upsert proposal.
 
 ## Problem and required contract
 
@@ -65,9 +65,9 @@ Operator labels and required behaviour. "Record not verified" means P is `not_co
 
 | W | P = committed | Record not verified |
 | --- | --- | --- |
-| `not_started` | "Blocked — no changes made" (BLOCKED row) | "Blocked — no changes made; record not verified". Nothing changed. A marker write that failed ambiguously may leave a pending protection row, which only fails closed |
+| `not_started` | "Blocked — no changes made" (BLOCKED row) | "Blocked — no changes made; record not verified". Nothing changed. An ambiguous guard write may leave a durable operation guard, which must remain protected until reconciled |
 | `failed` | "Failed", plus "automatic recovery succeeded" or "manual recovery required" as today | "Failed — record not verified; manual reconciliation required". The original workload error stays primary |
-| `succeeded` | "Succeeded" | "Succeeded in Docker — not durably recorded; manual reconciliation required". Never FAILED, never "no changes made", no compensation; the previous image stays protected by the P11 marker |
+| `succeeded` | "Succeeded" | "Succeeded in Docker — not durably recorded; manual reconciliation required". Never FAILED, never "no changes made", no compensation; the previous image and recovery backup remain protected by the P11 operation-scoped guard |
 | `uncertain` | The path's existing failure label plus "outcome uncertain" | Same, plus "record not verified; manual reconciliation required" |
 
 `contradictory` is additionally reported as "History contradiction" with both identities. For `uncertain`, each path keeps its existing `result`/`rollback_result` and adds `details.workload_outcome="uncertain"`; G2 does not change recovery for genuine workload uncertainty. History `result`/`rollback_result` vocabularies are unchanged. New facts go in additive `details` keys (`completion_id`, `workload_outcome`) and in the operation result (`workload`, `publication`, `outcome_verified`).
@@ -112,7 +112,7 @@ Before the first insert the publisher reads by key: an existing matching row is 
    - 3d. Read fails → **no insert**. Only reads are repeated, within the deadline. If none succeeds → `ambiguous`.
 4. Persistent unavailability (connections cannot open) → reads and writes both fail. Classification is `not_committed` only if every write failed before `commit()`; otherwise `ambiguous`.
 
-Factual fields compared: `action`, `result`, `stack`, `service`, `old_image_id`, `new_image_id` (when known), `details.completion_id` and `details.workload_outcome`. The same tree governs the P11 marker write and the terminal write. `finish_operation` is idempotent by its `WHERE status IN (active)` guard (`state.py:949-985`): rowcount 0 requires a read-back, and a different terminal status is `contradictory`.
+Factual fields compared: `action`, `result`, `stack`, `service`, `old_image_id`, `new_image_id` (when known), `details.completion_id` and `details.workload_outcome`. The same safety tree governs the P11 operation-guard write and the terminal write. `finish_operation` is idempotent by its `WHERE status IN (active)` guard (`state.py:949-985`): rowcount 0 requires a read-back, and a different terminal status is `contradictory`.
 
 ### P6 — Unverified publication
 
@@ -169,7 +169,7 @@ G2-S0 explicitly implements the **minimum G3 durable-intent foundation needed to
 
 ## 5. Per-path application and manual reconciliation
 
-| Path | Marker (P11) | Completion point | Key | Success publication | Failure-path publication | Removed behaviour |
+| Path | Operation guard (P11) | Completion point | Key | Success publication | Failure-path publication | Removed behaviour |
 | --- | --- | --- | --- | --- | --- | --- |
 | Ordinary update | Before pull (`operations.py:308`/`:323`) | `operations.py:355-357` | CLI uuid / web `operation_id` | SUCCESS via publisher; "Updated …" printed only after `committed` | FAILED via publisher, original error primary | FAILED row after a successful workload |
 | Pinned update | Before pull (`operations.py:124`) | `operations.py:152-155` | Same | SUCCESS with new pin via publisher | FAILED via publisher; guarded genuine-failure recovery unchanged | Pin restore and recreate triggered by publication failure |
