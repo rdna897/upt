@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import threading
 from .progress import BOOTSTRAP_STAGE_TOTAL, UPDATE_STAGE_TOTAL, RECONCILE_STAGE_TOTAL, UPDATE_RECORD_LABEL
+from .sqlite_outcome import AMBIGUOUS, NOT_COMMITTED, OwnedTransaction, WriteOutcomeError, sqlite_timeout
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -178,10 +179,14 @@ class State:
         self._schema_version = None
         self._quiescent_transition = quiescent_transition
 
-    def _new_connection(self):
-        """Open a configured connection after ensuring its containing directory."""
+    def _new_connection(self, timeout=None):
+        """Open a configured connection after ensuring its containing directory.
+
+        ``timeout`` bounds both the open and SQLite's busy wait (default 30 s).
+        """
+        timeout = sqlite_timeout(timeout)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        connection = sqlite3.connect(self.db_path, timeout=30)
+        connection = sqlite3.connect(self.db_path, timeout=timeout)
         connection.row_factory = sqlite3.Row
         os.chmod(self.db_path, 0o600)
         for suffix in ("-wal", "-shm"):
@@ -192,7 +197,8 @@ class State:
                 # SQLite may remove a sidecar while another connection closes.
                 pass
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=30000")
+        # Validated above, so the formatted value cannot carry SQL.
+        connection.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         return connection
 
     def ensure_compatible(self):
@@ -223,7 +229,7 @@ class State:
                     return
         self._ensure_schema(recheck=True)
 
-    def _ensure_schema(self, recheck=False):
+    def _ensure_schema(self, recheck=False, timeout=None):
         """Run ordered migrations once per State instance, never on each query."""
         if self._schema_ready and not recheck:
             return
@@ -231,7 +237,7 @@ class State:
             if self._schema_ready and not recheck:
                 return
             self._schema_ready = False
-            connection = self._new_connection()
+            connection = self._new_connection(timeout=timeout)
             try:
                 # WAL is configured before the migration transaction. Normal
                 # reads then use deferred read transactions and never reserve
@@ -275,10 +281,76 @@ class State:
             c.close()
 
     @contextmanager
-    def read(self):
-        """Open a consistent read transaction without a writer reservation."""
-        self._ensure_schema()
-        c = self._new_connection()
+    def write_transaction(self, *, timeout=None):
+        """Opt-in write transaction whose failures are classified (G2-S0a).
+
+        Returning normally means committed. Any ``Exception`` is re-raised as
+        ``WriteOutcomeError`` carrying ``NOT_COMMITTED`` only when commit was
+        never attempted and the transaction was still open, and ``AMBIGUOUS``
+        otherwise. The body receives an ``OwnedTransaction``: it may execute
+        statements but cannot commit, roll back or end the transaction.
+        ``BaseException`` (for example ``KeyboardInterrupt``) still rolls back
+        and propagates unclassified. Never hold this across Docker, Compose,
+        filesystem effects or sleeps.
+        """
+        try:
+            self._ensure_schema(timeout=timeout)
+            c = self._new_connection(timeout=timeout)
+        except Exception as exc:
+            raise WriteOutcomeError(NOT_COMMITTED, "connect", exc) from exc
+        try:
+            try:
+                c.execute("BEGIN IMMEDIATE")
+            except Exception as exc:
+                raise WriteOutcomeError(NOT_COMMITTED, "begin", exc) from exc
+            handle = OwnedTransaction(c)
+            try:
+                yield handle
+            except Exception as exc:
+                # Only a still-open transaction is provably discarded by rollback.
+                outcome = NOT_COMMITTED if c.in_transaction else AMBIGUOUS
+                self._quiet_rollback(c)
+                raise WriteOutcomeError(outcome, "body", exc) from exc
+            except BaseException:
+                self._quiet_rollback(c)
+                raise
+            finally:
+                handle._release()
+            if not c.in_transaction:
+                # Ended without UPT's commit (e.g. SQLite automatic rollback).
+                exc = RuntimeError("the owned SQLite transaction ended before commit")
+                raise WriteOutcomeError(AMBIGUOUS, "body", exc)
+            try:
+                c.commit()
+            except Exception as exc:
+                # A failed commit acknowledgement proves nothing either way.
+                self._quiet_rollback(c)
+                raise WriteOutcomeError(AMBIGUOUS, "commit", exc) from exc
+            except BaseException:
+                self._quiet_rollback(c)
+                raise
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass  # The outcome is already established; closing cannot change it.
+
+    @staticmethod
+    def _quiet_rollback(connection):
+        # Rollback cannot commit; its own failure must not mask the outcome.
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+
+    @contextmanager
+    def read(self, *, timeout=None):
+        """Open a consistent read transaction without a writer reservation.
+
+        ``timeout`` optionally bounds the open/busy wait (default 30 s).
+        """
+        self._ensure_schema(timeout=timeout)
+        c = self._new_connection(timeout=timeout)
         try:
             c.execute("BEGIN")
             yield c

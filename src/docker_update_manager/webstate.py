@@ -59,11 +59,11 @@ class WebState(State):
     supports_service_verification = False
     core_schema_identity = None
 
-    def _new_connection(self):
+    def _new_connection(self, timeout=None):
         # Validate before the open, then re-check the file SQLite created so a
         # swapped path cannot redirect reads or writes outside the managed tree.
         validate_web_files(self.root)
-        connection = super()._new_connection()
+        connection = super()._new_connection(timeout=timeout)
         try:
             _reject_unsafe_file(self.db_path, self.root)
         except BaseException:
