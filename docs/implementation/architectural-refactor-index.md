@@ -25,6 +25,8 @@ The repository-policy safeguards are tracked separately in [PR #1](https://githu
 | 7 | Web request adapters and presentation boundaries | Preserve auth, CSRF, sessions, SSE and wire contracts |
 | 8 | Combined integration, security, compatibility and release-readiness closure | Full clean-tree CI, isolated rehearsal, rollback evidence and separate deployment approval |
 
+**Current next gate — G2:** R10 is merged ([PR #14](https://github.com/rdna897/upt/pull/14)); its tracking issue #11 is closed. G2 [issue #9](https://github.com/rdna897/upt/issues/9) is next: [completion-policy design brief](g2-mutation-completion-policy.md), **design only**, with the already merged [characterisation tests (PR #13)](https://github.com/rdna897/upt/pull/13) as the baseline. Approve the completion policy before authorising any source correction or Stage 5 work. G3 [issue #10](https://github.com/rdna897/upt/issues/10) and R12 [issue #12](https://github.com/rdna897/upt/issues/12) remain separate. Production deployment remains frozen.
+
 Each stage may be accepted as **not warranted** when an independently reviewed cost/benefit analysis shows the extraction is worse than the status quo. A stage is not complete until review evidence and the owner's closeout are recorded. Do not expand programme scope or deploy intermediate phases implicitly.
 
 ## Change discipline
