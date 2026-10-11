@@ -214,13 +214,17 @@ Each slice replaces the matching characterisation tests in `tests/test_sqlite_co
 
 ## 7. Implementation slices
 
-Separately reviewed PRs, each independently revertible, none merged without owner approval:
+Each slice is reviewed separately, and no source change is authorised by this document. See the [revised S0 design](g2-s0-recovery-fence-design.md).
 
-- **G2-S0 (prerequisite; bounded G3 foundation):** per-operation durable guard with CLI/web identity, independent image and backup ownership; guarded cleanup/retention and mutation-admission checks; crash/prune/downgrade-safe lifecycle; `State` before/after-commit classification and per-call timeout (P4/P5 primitives); synthetic harness extensions. No change to success/failure completion reporting yet. **S0 is blocked on approval of the guard storage/compatibility contract**; no unsafe `protected_images` upsert.
-- **G2-S1 (R1):** shared publisher, deadline, typed exception, completion logger, ordinary update, web update adapter (P8 cases 1–2), CLI surface. Needs S0 and D9.
-- **G2-S2 (R2):** pinned update; remove database-triggered compensation; `--pin` gating. Needs S0 and S1.
-- **G2-S3 (R1b):** CLI and web rollback; web fallback gating; P9 guard. Needs S0, S1 and D9.
-- **G2-S4 (R3):** Compose apply onto the publisher; P8 case 3 in `recover_abandoned_operations`; namespace-update ambiguous-commit characterisation (tests only, D6); cross-path consistency review.
+- **S0a — inert State primitives:** pre-/during-commit classification, per-call timeout and synthetic harness.
+- **S0b — inert fence-aware enforcement:** typed `compose_bootstrap_fences` readers, central service/image/backup checks, `state_transition` downgrade gate, missing callers and API/SSE redaction. Existing namespace/bootstrap semantics remain intact. There are no active G2 fence writers yet.
+- **S0c — atomic publisher and release contract:** guarded History/ref/fence resolution inside one transaction, proof-based pre-boundary refusal handling, minimum audited operator resolution. **Activate each mutation-path writer only together with that path's corrected completion handler in S1/S2/S3**; do not expose false-FAILED code with an armed fence.
+- **S1 (R1):** shared completion publisher, deadline, error/log/CLI surface and ordinary update. The web update adapter and **P8 abandoned-operation reconciliation must ship together**, not in S4. CLI-only implementation can receive an independent review before D9; web activation requires D9.
+- **S2 (R2):** pinned update with no DB-triggered compensation and `--pin` follow-on gating.
+- **S3 (R1b):** CLI/web rollback, dedicated CLI pre-rollback backup, truthful web fallback and P9 guard (D9 required for web).
+- **S4 (R3):** Compose apply publication integration; namespace ambiguous-commit characterisation (tests only, D6); cross-path verification.
+
+Mandatory test coverage includes shared image owners, manual NULL-history protection intact, CLI crash with no web operation row, batch update retention, malformed evidence scoping, forced/directed image removal, backup TTL, pre-effect refusal after fence, atomic History resolution, namespace/Compose compatibility, and HTTP/SSE privacy.
 
 ## 8. Compatibility and rollout
 
