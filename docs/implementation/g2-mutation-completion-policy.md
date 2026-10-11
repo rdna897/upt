@@ -4,7 +4,7 @@
 **Tracking:** [issue #9](https://github.com/rdna897/upt/issues/9) (S6-R1, R1b, R2, R3).
 **Prerequisites:** [Stage 6a transaction-ownership decision](stage6-sqlite-state-ownership-review.md); merged [G2 characterisation PR #13](https://github.com/rdna897/upt/pull/13); merged [R10 PR #14](https://github.com/rdna897/upt/pull/14).
 **Deployment:** Production freeze remains in force. No Docker changes or live databases in development/tests.
-**S0 foundation:** [operation-scoped recovery-fence proposal](g2-s0-recovery-fence-design.md) (proposed for independent architectural review; not approved). It supersedes the earlier P11 `protected_images` upsert proposal.
+**S0 foundation:** [revised typed-fence design](g2-s0-recovery-fence-design.md) (provisional after independent Opus review, not approved). Earlier `protected_images` upsert and CLI `operation_runs` approaches are withdrawn.
 
 ## Problem and required contract
 
@@ -84,7 +84,7 @@ One core helper (proposed `src/docker_update_manager/completion.py`; the name is
 
 ### P3 — Completion key
 
-A 32-hex `completion_id` is fixed before the mutation boundary: web operations use their `operation_id` and CLI operations generate a uuid4 hex. It is stored in history `details.completion_id` and in the independent P11 operation-scoped guard. P11 also requires a durable **pre-mutation operation row for CLI**, a deliberately bounded G3 foundation. Lookup is a bounded `history_for_service(stack, service)` scan filtered by `action` and parsed `details.completion_id`, the pattern Compose apply already uses (`webservice.py:2625-2628`). There is no `json_extract` dependency. No uniqueness index is proposed here; P5 and update-lock single-writer semantics require explicit verification, not assumption.
+A 32-hex `completion_id` is fixed before the mutation boundary: web operations use their `operation_id` and CLI operations generate a uuid4 hex. It is stored in history `details.completion_id` and in the independent P11 operation-scoped guard. P11 uses a durable **CLI fence row** independent of web `operation_runs`, bringing forward only a bounded G3 identity foundation. Lookup is a bounded `history_for_service(stack, service)` scan filtered by `action` and parsed `details.completion_id`, the pattern Compose apply already uses (`webservice.py:2625-2628`). There is no `json_extract` dependency. No uniqueness index is proposed here; P5 and update-lock single-writer semantics require explicit verification, not assumption.
 
 ### P4 — One monotonic completion deadline
 
@@ -112,7 +112,7 @@ Before the first insert the publisher reads by key: an existing matching row is 
    - 3d. Read fails → **no insert**. Only reads are repeated, within the deadline. If none succeeds → `ambiguous`.
 4. Persistent unavailability (connections cannot open) → reads and writes both fail. Classification is `not_committed` only if every write failed before `commit()`; otherwise `ambiguous`.
 
-Factual fields compared: `action`, `result`, `stack`, `service`, `old_image_id`, `new_image_id` (when known), `details.completion_id` and `details.workload_outcome`. The same safety tree governs the P11 operation-guard write and the terminal write. `finish_operation` is idempotent by its `WHERE status IN (active)` guard (`state.py:949-985`): rowcount 0 requires a read-back, and a different terminal status is `contradictory`.
+Factual fields compared: `action`, `result`, `stack`, `service`, `old_image_id`, `new_image_id` (when known), `details.completion_id` and `details.workload_outcome`. The same safety tree governs the P11 typed-fence insertion and the terminal write; factual History and the matching fence resolution commit atomically. `finish_operation` is idempotent by its `WHERE status IN (active)` guard (`state.py:949-985`): rowcount 0 requires a read-back, and a different terminal status is `contradictory`.
 
 ### P6 — Unverified publication
 
@@ -133,11 +133,11 @@ Three cases are distinct:
    - W = `succeeded`: the terminal status is **unresolved** (D9), with result `{workload: "succeeded", publication, completion_id, outcome_verified: false, manual_reconciliation_required: true}`. `succeeded` is used **only** when the history row is durably committed (D2);
    - W = `uncertain`: today's terminal mapping (`failed` with manual recovery required) is kept unless the D9 decision extends `unresolved` to in-process uncertain outcomes.
 2. **Terminal publication fails** (deadline exhausted). The adapter never falls through to `finish_operation(failed)` or a failure audit. The operation stays active in the database, the P7 log record is written, and the worker exits normally, releasing the lock.
-3. **Post-restart / post-worker reconciliation** (`recover_abandoned_operations`, which already requires the update lock as its liveness proof). For a stale update/rollback operation:
+3. **Post-restart / post-worker reconciliation** (`recover_abandoned_operations`, which requires the update lock). This ships alongside **S1 web correctness**, not S4. For a stale update/rollback operation:
    - **No committed guard** and the operation was created by a P11-aware binary (`summary.completion_protocol >= 1` recorded at operation creation, independently of guard insertion) → the boundary was never authorised → `blocked`, "no changes were made", subject to proving no effect path bypasses P11.
    - **No guard** on a legacy operation → today's behaviour is retained (`failed`, "check the container and History"), because absence proves nothing.
-   - **Guard present** and exactly one matching committed history row (same completion key and `old_image_id` as the guard) → the terminal status the in-process adapter would have published for that row under case 1, with the warning "terminal state recovered after interruption".
-   - **Guard present** and no row, a contradictory row, or reads that fail → **unresolved**. `mutation_performed: null`, `outcome_verified: false`, `manual_reconciliation_required: true`. Never `succeeded` or `failed`.
+   - **Fence row present (active, manual or resolved)** and exactly one matching committed history row (same completion key and `old_image_id` as the guard) → the terminal status the in-process adapter would have published for that row under case 1, with the warning "terminal state recovered after interruption".
+   - **Unresolved fence present** and no row, a contradictory row, or reads that fail → **unresolved**. `mutation_performed: null`, `outcome_verified: false`, `manual_reconciliation_required: true`. Never `succeeded` or `failed`.
    - **Never replay.** Recovery issues no Docker or Compose command and does not restore sources. The operation-scoped guard, every independently owned image protection, and all guarded backup paths are retained.
    - If the database is unavailable at restart, recovery cannot run and the operation stays active; the API reports the database error rather than a status. The contract applies once the database is readable again.
 
@@ -188,7 +188,7 @@ S0 brings forward only durable CLI completion identity via the fence and the nec
 3. Check History for a row with that `completion_id` (`upt history`).
 4. Do not run `upt cleanup`, forced retention or manual image removal for the previous image until reconciled. P11 must block UPT's own removal paths for both the image and its backup.
 5. Do not re-run the update or rollback to "repair" the record; P9 refuses an inconsistent rollback.
-6. Release of an unresolved operation guard or creation of a corrective History record needs a reviewed tool (G3). Until then, leave the guard and every independently owned protection in place. Direct database edits are outside the supported procedure.
+6. A **minimal audited operator-only resolution path** is required before G2 guard writers are activated. Release the named fence only after independent evidence and correlated History are proved, or atomically publish a verified corrective record. Otherwise leave it fenced. Full guided reconciliation remains in G3; direct database edits are unsupported.
 
 ## 6. Synthetic test plan
 
