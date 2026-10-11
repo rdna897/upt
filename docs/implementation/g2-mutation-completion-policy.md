@@ -216,25 +216,26 @@ Each slice replaces the matching characterisation tests in `tests/test_sqlite_co
 
 ## 7. Implementation slices
 
-Each slice is reviewed separately, and no source change is authorised by this document. See the [revised S0 design](g2-s0-recovery-fence-design.md).
+Each slice needs a separate PR and independent review; this draft authorises **documentation only**. See the [schema-10 S0 proposal](g2-s0-recovery-fence-design.md).
 
-- **S0a — inert State primitives:** pre-/during-commit classification, per-call timeout and synthetic harness.
-- **S0b — inert fence-aware enforcement:** typed `compose_bootstrap_fences` readers, central service/image/backup checks, `state_transition` downgrade gate, missing callers and API/SSE redaction. Existing namespace/bootstrap semantics remain intact. There are no active G2 fence writers yet.
-- **S0c — atomic publisher and release contract:** guarded History/ref/fence resolution inside one transaction, proof-based pre-boundary refusal handling, minimum audited operator resolution. **Activate each mutation-path writer only together with that path's corrected completion handler in S1/S2/S3**; do not expose false-FAILED code with an armed fence.
-- **S1 (R1):** shared completion publisher, deadline, error/log/CLI surface and ordinary update. The web update adapter and **P8 abandoned-operation reconciliation must ship together**, not in S4. CLI-only implementation can receive an independent review before D9; web activation requires D9.
-- **S2 (R2):** pinned update with no DB-triggered compensation and `--pin` follow-on gating.
-- **S3 (R1b):** CLI/web rollback, dedicated CLI pre-rollback backup, truthful web fallback and P9 guard (D9 required for web).
-- **S4 (R3):** Compose apply publication integration; namespace ambiguous-commit characterisation (tests only, D6); cross-path verification.
+- **S0a — storage-independent:** classify SQLite errors before/during commit, allow per-call timeout under a monotonic publication deadline, and extend the synthetic fault harness. **No schema or observable workload change.** This may be independently approved before D10.
+- **S0b — schema-10 storage and inert enforcement:** independently approved, **offline** schema-9→10 transition; `completion_fences` and `completion_fence_claims` indexes; service/backup/image admission/removal predicates, migration/rollback gates, API/SSE redaction, safety tests. **No G2 writers enabled.** Preserve all existing namespace/bootstrap behaviour.
+- **S0c — atomic publication and operator recovery:** guarded `State.record` transaction with exact History/fence resolution, non-destructive `protected_images` handling, post-arm/no-effect proof and minimal audited reconciliation. **Activate writers only with their corresponding S1/S2/S3 corrected completion handlers**, never in a half-enabled release.
+- **S1 (R1):** shared publisher, bounded retries, CLI error/log contract, ordinary update and per-service batch retention safety. Web update adapter **and post-restart P8 recovery must ship together** (D9 web compatibility prerequisite).
+- **S2 (R2):** pinned update without a database-triggered reversal; follow-on pin gating; namespace-consumer fence exclusion and regression protection.
+- **S3 (R1b):** CLI and web rollback, a new CLI pre-rollback source backup, correct image claims, web fallback gating and P9 guard.
+- **S4 (R3):** Compose apply completion integration, namespace-update ambiguous-commit characterisation (tests only, D6), cross-path consistency.
 
-Mandatory test coverage includes shared image owners, manual NULL-history protection intact, CLI crash with no web operation row, batch update retention, malformed evidence scoping, forced/directed image removal, backup TTL, pre-effect refusal after fence, atomic History resolution, namespace/Compose compatibility, and HTTP/SSE privacy.
+Test gates include namespace-consumer update success unchanged; web internal own-fence revalidation; drifted Compose file lists, moved project and same stack/service aliases; shared-image owners; old `NULL` manual protections unchanged; unclear commit plus failed reads; History/fence atomicity; source/target evidence enrichment; CLI-only crash; service-batch partial failure followed by retention; all deletion and service mutation bypasses; HTTP/SSE redaction; guarded backup TTL; malformed evidence; G2-only resolved-row pruning; offline migration, older-binary refusal and downgrade safety.
 
 ## 8. Compatibility and rollout
 
-- No schema migration; `CORE_SCHEMA_VERSION` stays 9 (`state.py:119`).
-- Additive `details` and operation `summary`/`result` keys only. CLI success rows gain JSON `details` (previously none); S1 must verify that every History reader tolerates this.
-- Existing binaries (including R10) do **not** understand the proposed operation-scoped P11 guards. Downgrade/partial deployment with unresolved guards is unsupported (D3b), and a verified deployment/rollback gate is required before release. S0 must update all relevant cleanup/admission/retention paths together.
-- The `unresolved` operation status (if D9 is approved) requires `webapp.py`, `operation_presentation.py`, `static/operation.js`, SSE terminal detection and API clients to be updated together. Older web binaries' handling of an unknown status must be assessed before adoption.
-- Per-slice rollback is permitted only when the guard compatibility gate proves no unresolved new-protocol guards remain; otherwise binary revert is unsafe. The production freeze stays in force; no slice implies deployment.
+- **Schema 10 is proposed, not authorised.** It requires a separate offline quiescent 9→10 transition with snapshots, integrity checks and explicit operator approval. Schema-9 binaries refuse schema 10, mechanically preventing their image/backup cleanup from operating on new guard state.
+- The `core_schema_identity` trust contract and older version gate remain strict; avoid implicit migrations. Validate complete rollback eligibility: never restore a stale schema-9 snapshot over newer History or unresolved recovery claims.
+- Additive History `details` and web `summary/result` keys remain backward readable in the new binary, but schema 10 means **binary revert is not an authorised data rollback**. A supported state-preserving 10→9 route, if needed, must be separately designed and reviewed.
+- **D9 web `unresolved` status** remains a separate API/UI/SSE, frontend and older-web-compatibility decision. No G2 web completion path activates without its matching post-restart recovery.
+- **Namespace/Compose compatibility:** dedicated G2 tables never replace `compose_bootstrap_fences`, existing namespace markers or their recovery receipts; service admission must check both systems. No automatic recovery replay.
+- Production deployment freeze remains in force. No stage implies deployment or restart.
 
 ## 9. Decision register
 
