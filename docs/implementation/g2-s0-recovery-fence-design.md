@@ -1,6 +1,6 @@
 # G2-S0 — Recovery ownership and completion fence (schema-10 design)
 
-**Status:** Design proposal after independent Opus re-review of PR #15 at `740555e`. **Option B is the recommended planning direction, not owner approval or implementation authority.** See [G2 policy](g2-mutation-completion-policy.md), [G2 issue #9](https://github.com/rdna897/upt/issues/9), [G3 issue #10](https://github.com/rdna897/upt/issues/10).
+**Status:** Design proposal after independent architecture re-review of PR #15 at `740555e`. **Option B is the recommended planning direction, not owner approval or implementation authority.** See [G2 policy](g2-mutation-completion-policy.md), [G2 issue #9](https://github.com/rdna897/upt/issues/9), [G3 issue #10](https://github.com/rdna897/upt/issues/10).
 **Baseline:** public schema 9, merged G2 characterisation PR #13 and R10 PR #14.
 **Freeze:** No production deployment, service restart, schema migration or Docker/database mutation under this design PR.
 
