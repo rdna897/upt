@@ -171,7 +171,7 @@ S0 brings forward only durable CLI completion identity via the fence and the nec
 
 ## 5. Per-path application and manual reconciliation
 
-| Path | Operation guard (P11) | Completion point | Key | Success publication | Failure-path publication | Removed behaviour |
+| Path | Typed fence (P11) | Completion point | Key | Success publication | Failure-path publication | Removed behaviour |
 | --- | --- | --- | --- | --- | --- | --- |
 | Ordinary update | Before pull (`operations.py:308`/`:323`) | `operations.py:355-357` | CLI uuid / web `operation_id` | SUCCESS via publisher; "Updated …" printed only after `committed` | FAILED via publisher, original error primary | FAILED row after a successful workload |
 | Pinned update | Before pull (`operations.py:124`) | `operations.py:152-155` | Same | SUCCESS with new pin via publisher | FAILED via publisher; guarded genuine-failure recovery unchanged | Pin restore and recreate triggered by publication failure |
@@ -242,16 +242,16 @@ Provisional direction is as recorded from the owner's review instructions (2026-
 | --- | --- | --- | --- |
 | D1 | CLI exit status for factual success with unverified publication | 30 (`EXIT_FATAL`), with separate factual-success and publication-failure messages | Confirmation |
 | D2 | Web terminal status | `succeeded` with warning **only** when History is durably committed; otherwise unresolved | Confirmation; depends on D9 |
-| D3 | Enforceable image/backup protection and G2/G3 sequencing | Adopt a durable operation-scoped guard, independent of the one-row-per-image `protected_images` table; S0 advances the minimum G3 intent foundation, with full CLI recovery in G3 | Approve S0 ownership, retention and admission contracts; review `operation_runs` suitability |
+| D3 | Image/backup protection and sequencing | Use service-scoped typed fence claims, retaining independent image owners and every claimed backup; bring forward only CLI fence identity | Owner review of safeguard, claim validation and atomic release |
 | D3b | Binary downgrade/partial-upgrade floor | Do not run older binaries that lack P11 guard enforcement while any unresolved guard exists; R10 alone is insufficient | Separate compatibility and rollout decision |
 | D3c | Retain the exact backup of an unresolved completion past age expiry | **Required for S0**; skip guarded backups in inventory, real/forced retention and final delete revalidation; other backups retain normal TTL | Confirm path/ownership and safe-downgrade contract |
 | D4 | Rollback running-image identity guard (P9) | Accept, fail closed. Side effects: a second rollback after a completed rollback, and rollback after an out-of-band image change, are refused pending reconciliation | Confirmation |
 | D5 | Retry bound | One monotonic completion deadline (P4); recommended 60 s | Confirmation of the budget value |
 | D6 | Namespace-update ambiguous commit | Characterise first (tests only, S4); any fix is a separate decision | Confirmation |
 | D7 | Unrelated single-write mutation records (`do_pin` at `operations.py:70`, removal, others) | Defer with explicit tracking; open a tracking issue before S1 merges | Tracking issue creation |
-| D8 | Reconciliation tool | Defer the automated tool to G3; the section 5 manual procedure is the interim | Confirmation |
+| D8 | Reconciliation tool | Require a **minimal audited operator-only fence reconciliation/release** before G2 writers activate; defer broader guided tooling to G3 | Owner approval of proof, audit and privilege requirements |
 | D9 | Status vocabulary for unverified outcomes | Recommended: new terminal operation status `unresolved` (API/UI contract change), used for unverified succeeded publication and for guard-present interrupted operations. Consider in-process uncertain outcomes separately | **Separate compatibility decision**, including SSE, polling and old web binaries; blocks S1, S3 and S4 |
-| D10 | Storage and admission model for operation guards | Prefer existing core `operation_runs` + versioned summary for CLI/web, without overriding `protected_images`; if lifecycle is unsuitable, request approval for narrowly scoped schema migration | Architectural review of G2-S0 fence proposal; blocks S0 |
+| D10 | Guard storage and admission | Prefer typed G2 evidence in existing `compose_bootstrap_fences` with CLI-independent fence IDs, service-scoped admission and multi-owner image/backup claims; schema-10 fallback if necessary | Verify all existing fence consumers and compatibility; blocks S0 |
 
 ## 10. Risks
 
@@ -260,7 +260,7 @@ Provisional direction is as recorded from the owner's review instructions (2026-
 - P11 retains image, backup and durable completion evidence until verified or manual/G3 reconciliation: disk cost by design.
 - Operation-scoped guards require every deletion and admission path to consult durable state; an incomplete rollout must fail closed, not silently trust old `protected_images` semantics.
 - D9 touches the web wire contract and requires an explicit terminal/polling compatibility gate.
-- CLI use of core `operation_runs` requires lifecycle and pruning review; schema-9 suitability is not assumed.
+- Typed reuse of `compose_bootstrap_fences` requires a namespace/bootstrap consumer audit, bounded evidence validation and careful malformed-row behaviour; schema-9 suitability is not assumed.
 
 ## 11. Review history
 
@@ -270,7 +270,8 @@ Provisional direction is as recorded from the owner's review instructions (2026-
   - (H2) no durable protection when nothing commits → P11 pre-mutation marker with pending protection, enforced by existing cleanup/retention, sequenced as G2-S0 (P12);
   - (M3) retry after an ambiguous commit with a failed read could duplicate → P5 invariant and decision tree, `contradictory` outcome, tests 3–5;
   - (M4) the deadline bounded writes only → P4 single monotonic deadline covering every completion-side step.
-- **Independent review of `84d5170` (follow-up):** identified three remaining High risks in the P11 upsert (existing manual ownership erased), age-only backup expiry, and absent mutation admission fence; plus a Medium protocol-capability/guard-creation ordering inconsistency. The [S0 operation-scoped fence proposal](g2-s0-recovery-fence-design.md) replaces P11's upsert and moves backup retention/admission and minimal CLI durable intent into S0. These remain **proposals pending independent Opus critique and owner decisions**, not approved code.
+- **Independent review of `84d5170`:** identified manual ownership collision, expiry of backup evidence, missing mutation admission and inconsistent protocol capability; the first S0 architecture was proposed.
+- **Independent Opus review of `8acdac5`:** H1–H4 found summary-only fencing incompatible with existing gate semantics, synthetic CLI web-operation lifecycle, no safe resolution path and non-atomic guard release. M1–M6 identified admission/removal bypasses, shared-image overblocking, web evidence leaks, missing rollback claims, batch retention and late post-restart recovery. [Revised S0 design](g2-s0-recovery-fence-design.md) answers these by proposal only, and notes that reuse of the existing fence table is **not** by itself sufficient to protect image cleanup on old binaries.
 
 ## 12. Design acceptance gate
 
