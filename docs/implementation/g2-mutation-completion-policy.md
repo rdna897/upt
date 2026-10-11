@@ -245,8 +245,8 @@ Provisional direction is as recorded from the owner's review instructions (2026-
 | --- | --- | --- | --- |
 | D1 | CLI exit status for factual success with unverified publication | 30 (`EXIT_FATAL`), with separate factual-success and publication-failure messages | Confirmation |
 | D2 | Web terminal status | `succeeded` with warning **only** when History is durably committed; otherwise unresolved | Confirmation; depends on D9 |
-| D3 | Image/backup protection and sequencing | Use service-scoped typed fence claims, retaining independent image owners and every claimed backup; bring forward only CLI fence identity | Owner review of safeguard, claim validation and atomic release |
-| D3b | Binary downgrade/partial-upgrade floor | Do not run older binaries that lack P11 guard enforcement while any unresolved guard exists; R10 alone is insufficient | Separate compatibility and rollout decision |
+| D3 | Image/backup protection and sequencing | Schema-10 owner-scoped fences and indexed image/backup claims; independent shared-image owners and stable service identity | Review proof model, complete admission/deletion coverage and atomic release |
+| D3b | Binary downgrade/partial-upgrade floor | Schema-9 binaries must refuse schema 10; never restore stale pre-upgrade state or silently run old cleanup over new claims | Approve offline 9→10 transition, compatibility tests and state-preserving downgrade gate |
 | D3c | Retain the exact backup of an unresolved completion past age expiry | **Required for S0**; skip guarded backups in inventory, real/forced retention and final delete revalidation; other backups retain normal TTL | Confirm path/ownership and safe-downgrade contract |
 | D4 | Rollback running-image identity guard (P9) | Accept, fail closed. Side effects: a second rollback after a completed rollback, and rollback after an out-of-band image change, are refused pending reconciliation | Confirmation |
 | D5 | Retry bound | One monotonic completion deadline (P4); recommended 60 s | Confirmation of the budget value |
@@ -254,7 +254,7 @@ Provisional direction is as recorded from the owner's review instructions (2026-
 | D7 | Unrelated single-write mutation records (`do_pin` at `operations.py:70`, removal, others) | Defer with explicit tracking; open a tracking issue before S1 merges | Tracking issue creation |
 | D8 | Reconciliation tool | Require a **minimal audited operator-only fence reconciliation/release** before G2 writers activate; defer broader guided tooling to G3 | Owner approval of proof, audit and privilege requirements |
 | D9 | Status vocabulary for unverified outcomes | Recommended: new terminal operation status `unresolved` (API/UI contract change), used for unverified succeeded publication and for guard-present interrupted operations. Consider in-process uncertain outcomes separately | **Separate compatibility decision**, including SSE, polling and old web binaries; blocks S1, S3 and S4 |
-| D10 | Guard storage and admission | Prefer typed G2 evidence in existing `compose_bootstrap_fences` with CLI-independent fence IDs, service-scoped admission and multi-owner image/backup claims; schema-10 fallback if necessary | Verify all existing fence consumers and compatibility; blocks S0 |
+| D10 | Guard storage and admission | **Prefer Option B:** schema-10 `completion_fences` plus indexed `completion_fence_claims`, preserving bootstrap/namespace separation | Explicit owner approval after migration/admission/lifecycle design review; blocks S0b/S0c |
 
 ## 10. Risks
 
@@ -263,7 +263,7 @@ Provisional direction is as recorded from the owner's review instructions (2026-
 - P11 retains image, backup and durable completion evidence until verified or manual/G3 reconciliation: disk cost by design.
 - Operation-scoped guards require every deletion and admission path to consult durable state; an incomplete rollout must fail closed, not silently trust old `protected_images` semantics.
 - D9 touches the web wire contract and requires an explicit terminal/polling compatibility gate.
-- Typed reuse of `compose_bootstrap_fences` requires a namespace/bootstrap consumer audit, bounded evidence validation and careful malformed-row behaviour; schema-9 suitability is not assumed.
+- Dedicated schema-10 tables avoid namespace/bootstrap fence collision, but still require scoped malformed-evidence refusal, own-fence web revalidation, stable identity drift checks, auditable release and safe pruning.
 
 ## 11. Review history
 
@@ -274,7 +274,8 @@ Provisional direction is as recorded from the owner's review instructions (2026-
   - (M3) retry after an ambiguous commit with a failed read could duplicate → P5 invariant and decision tree, `contradictory` outcome, tests 3–5;
   - (M4) the deadline bounded writes only → P4 single monotonic deadline covering every completion-side step.
 - **Independent review of `84d5170`:** identified manual ownership collision, expiry of backup evidence, missing mutation admission and inconsistent protocol capability; the first S0 architecture was proposed.
-- **Independent Opus review of `8acdac5`:** H1–H4 found summary-only fencing incompatible with existing gate semantics, synthetic CLI web-operation lifecycle, no safe resolution path and non-atomic guard release. M1–M6 identified admission/removal bypasses, shared-image overblocking, web evidence leaks, missing rollback claims, batch retention and late post-restart recovery. [Revised S0 design](g2-s0-recovery-fence-design.md) answers these by proposal only, and notes that reuse of the existing fence table is **not** by itself sufficient to protect image cleanup on old binaries.
+- **Independent Opus review of `8acdac5`:** H1–H4 found summary-only fencing incompatible with existing gate semantics, synthetic CLI web-operation lifecycle, no safe resolution path and non-atomic guard release. M1–M6 identified admission/removal bypasses, shared-image overblocking, web evidence leaks, missing rollback claims, batch retention and late post-restart recovery.
+- **Independent Opus re-review of `740555e`:** shared `compose_bootstrap_fences` reuse conflicts with namespace updates and in-flight web revalidation, and schema 9 cannot mechanically exclude older cleaners. M1–M5 require protection ownership, stable identity, strict claims, release evidence and G2-only pruning. The [new S0 schema-10 proposal](g2-s0-recovery-fence-design.md) makes Option B the preferred planning direction, subject to owner approval.
 
 ## 12. Design acceptance gate
 
