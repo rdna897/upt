@@ -1,6 +1,6 @@
 # G2-S0 — Operation-scoped recovery fence (proposed architecture)
 
-**Status:** Proposed ChatGPT architecture for review, not implementation authorisation. Linked from [G2 policy](g2-mutation-completion-policy.md), [G2 #9](https://github.com/rdna897/upt/issues/9) and [G3 #10](https://github.com/rdna897/upt/issues/10). This design deliberately brings forward the **minimum durable-intent foundation needed for safe G2 completion**; full CLI interruption recovery and operator tooling remain G3. Production deployment is frozen.
+**Status:** Proposed architecture for independent review, not implementation authorisation. Linked from [G2 policy](g2-mutation-completion-policy.md), [G2 #9](https://github.com/rdna897/upt/issues/9) and [G3 #10](https://github.com/rdna897/upt/issues/10). This design deliberately brings forward the **minimum durable-intent foundation needed for safe G2 completion**; full CLI interruption recovery and operator tooling remain G3. Production deployment is frozen.
 
 ## Decision and rejected approach
 
