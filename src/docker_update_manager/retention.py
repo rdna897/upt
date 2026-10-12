@@ -63,6 +63,8 @@ class CleanupState:
         try: self._fd=os.open(state.db_path,os.O_RDONLY|os.O_CLOEXEC)
         except FileNotFoundError:
             raise RuntimeError(f"UPT state database is missing; rollback protection cannot be verified, so {_REFUSED}") from None
+        except OSError as exc:
+            raise RuntimeError(f"UPT state database cannot be opened ({exc.strerror or type(exc).__name__}); {_REFUSED}") from None
         try:
             pinned=os.fstat(self._fd); self._identity=(pinned.st_dev,pinned.st_ino)
             with self._read() as c: self._require_schema(c,current=False)
@@ -104,7 +106,7 @@ class CleanupState:
             # any looser record anywhere could bypass this decision there.
             recorded=[row[0] for row in c.execute("SELECT image_id FROM rollback_refs UNION ALL SELECT image_id FROM protected_images")]
         try: current=os.stat(self.state.db_path)
-        except FileNotFoundError: current=None
+        except OSError: current=None
         if current is None or (current.st_dev,current.st_ino)!=self._identity:
             raise RuntimeError(f"UPT state database was replaced during cleanup; {_REFUSED}")
         if any(not isinstance(value,str) or canonical_image_id(value)!=value for value in recorded):

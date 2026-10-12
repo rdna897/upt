@@ -432,7 +432,7 @@ def _cleanup(pinned,args,reporter):
     candidates=[x for x in dangling if not cleanup_blocker(protection,x)]
     print(f"Dangling image candidates: {len(candidates)}\nProtected rollback images: {len(protected)}\nInvalid image identities: {len(invalid)}")
     for x in candidates: print("  "+x)
-    if protected: print("Protected (not removed):")
+    if protected: print("Protected (not removed; rollback images still expire through normal retention, see `upt retention`):")
     for x,reason in protected: print(f"  {x}  {reason}")
     if invalid: print("Invalid (not removed):")
     for x in invalid: print("  "+x)
@@ -564,6 +564,8 @@ def main(argv=None):
                 if significant: quick_snapshot(state,kind=f"before-{args.command}",reporter=NULL_REPORTER)
                 result=execute(args,p,cfg,state,reporter)
                 if significant: quick_snapshot(state,kind=f"after-{args.command}",reporter=NULL_REPORTER)
+                # The retention pass below must act on the same verified state.
+                if args.command=="cleanup": args.cleanup_state.protection()
                 retained=retention_cleanup(cfg,state,reporter=NULL_REPORTER,automatic=True)
                 if retained.get("files_removed") or retained.get("images_removed") or retained.get("images_absent"):
                     print(f"\nRetention cleanup: {retained['files_removed']} artefact(s), {retained['images_removed']} image(s), {retained.get('images_absent',0)} absent image(s) reconciled, {human_size(retained['reclaimed'])} reclaimed.")

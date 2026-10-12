@@ -354,6 +354,49 @@ class CleanupProtectionTests(unittest.TestCase):
             self.assertEqual((root / "history.sqlite3").read_bytes(), before, name)
             self.assertEqual(docker.removed, [], name)
 
+    def test_unopenable_database_is_fatal_not_a_traceback(self):
+        real_open = os.open
+
+        def denied(path, *args, **kwargs):
+            if Path(path) == self.state.db_path:
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, *args, **kwargs)
+        docker = _Docker([FREE])
+        err = io.StringIO()
+        with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
+                patch("docker_update_manager.retention.os.open", denied), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = cli.main(["cleanup", "--yes"])
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertIn("cannot be opened", err.getvalue())
+        self.assertEqual(docker.calls, [])
+
+    def test_retention_pass_refuses_when_state_is_replaced_after_cleanup(self):
+        self.record(PROTECTED)
+
+        def replace_state(image):
+            os.replace(self.state.db_path, self.root / "moved.sqlite3")
+            for suffix in ("-wal", "-shm"):
+                Path(str(self.state.db_path) + suffix).unlink(missing_ok=True)
+            State(self.state.root).ensure_compatible()  # another valid database
+        docker = _Docker([FREE], on_rm=replace_state)
+        with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
+                patch.object(cli, "quick_snapshot", lambda *a, **k: None), \
+                patch.object(cli, "retention_cleanup") as retention, \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = cli.main(["cleanup", "--yes"])
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertEqual(docker.removed, [FREE])
+        retention.assert_not_called()
+
+    def test_web_state_supports_existing_only_reads(self):
+        from docker_update_manager.webstate import WebState
+        web = WebState(self.root / "web")
+        with patch.dict(os.environ, {"UPT_TESTING": "1"}):
+            web.ensure_compatible()
+            with web.read_existing() as c:
+                self.assertTrue(c.execute("SELECT version FROM schema_version").fetchone())
+
     def test_existing_only_state_never_creates_or_initialises(self):
         missing = State(self.root / "absent", require_existing=True)
         with self.assertRaises(sqlite3.OperationalError):
@@ -393,7 +436,7 @@ class CleanupProtectionTests(unittest.TestCase):
         self.assertEqual([c[:3] for c in docker.calls], [["docker", "image", "ls"]])
         candidates = out.split("Dangling image candidates: ", 1)[1]
         self.assertTrue(candidates.startswith("1\n"))
-        self.assertIn(f"  {FREE}\nProtected (not removed):\n  {PROTECTED}  ROLLBACK PROTECTED", out)
+        self.assertIn(f"  {FREE}\nProtected (not removed; rollback images still expire through normal retention, see `upt retention`):\n  {PROTECTED}  ROLLBACK PROTECTED", out)
         self.assertIn("DRY RUN — no images removed.", out)
         with self.state.read() as c:
             after = [tuple(r) for r in c.execute("SELECT * FROM rollback_refs UNION ALL SELECT image_id,reason,history_id,created,NULL FROM protected_images")]
