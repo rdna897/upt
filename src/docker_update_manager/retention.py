@@ -38,7 +38,6 @@ _CLEANUP_PROTECTED=(
     "UNION SELECT p.image_id FROM protected_images p WHERE NOT "+_matching_ref()
 )
 _IMAGE_ID=re.compile(r"sha256:[0-9a-f]{64}")
-_HEX=re.compile(r"[0-9a-f]{1,64}")
 
 def canonical_image_id(value):
     """Return ``sha256:<64 lowercase hex>``, or None for anything less exact."""
@@ -46,41 +45,52 @@ def canonical_image_id(value):
     text=value.strip().lower()
     return text if _IMAGE_ID.fullmatch(text) else None
 
-def cleanup_protection(state):
-    """Read dangling-cleanup protection in one short read, failing closed.
-
-    Returns ``(exact, abbreviated)``: canonical protected IDs, and hex prefixes
-    of stored IDs that are not canonical. An abbreviated record blocks every
-    image it could name. Missing, unreadable or incompatible state, or a stored
-    identity that is not an image ID at all, raises instead of returning an
-    empty protection set.
-    """
-    if not state.db_path.exists():
-        raise RuntimeError("UPT state database is missing; rollback protection cannot be verified, so no image was removed")
+def _require_initialised(path):
+    # mode=rw never creates a file, unlike State's lazy schema initialisation.
     try:
-        # Re-checks schema version/identity even for a long-lived State.
-        state.ensure_compatible()
-        with state.read() as c: values=[row[0] for row in c.execute(_CLEANUP_PROTECTED)]
-    except sqlite3.Error as exc:
-        raise RuntimeError(f"rollback protection could not be read ({exc}); no image was removed") from None
-    exact=set(); abbreviated=set()
-    for value in values:
-        canonical=canonical_image_id(value)
-        if canonical: exact.add(canonical); continue
-        text=value.strip().lower() if isinstance(value,str) else ""
-        text=text[7:] if text.startswith("sha256:") else text
-        if not _HEX.fullmatch(text):
-            raise RuntimeError("rollback protection contains an unrecognised image identity; no image was removed")
-        abbreviated.add(text)
-    return exact,abbreviated
+        c=sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw",uri=True)
+        try: row=c.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        finally: c.close()
+    except sqlite3.Error: row=None
+    if row is None:
+        raise RuntimeError("UPT state database is not initialised; rollback protection cannot be verified, so no image was removed")
+
+def cleanup_protection(state):
+    """Read the canonical IDs dangling-image cleanup must keep, failing closed.
+
+    Missing, empty, uninitialised, unreadable, incompatible or replaced state
+    raises instead of returning an empty protection set, as does any stored
+    identity that is not exactly canonical: R10 retention matches stored IDs by
+    exact string, so a looser record would not protect the image from it.
+    """
+    try: pin=os.open(state.db_path,os.O_RDONLY|os.O_CLOEXEC)
+    except FileNotFoundError:
+        raise RuntimeError("UPT state database is missing; rollback protection cannot be verified, so no image was removed") from None
+    try:
+        # The open descriptor keeps the inode alive, so a replaced database
+        # cannot reuse its identity before the final comparison.
+        pinned=os.fstat(pin)
+        _require_initialised(state.db_path)
+        try:
+            # Re-checks schema version/identity even for a long-lived State.
+            state.ensure_compatible()
+            with state.read() as c: values=[row[0] for row in c.execute(_CLEANUP_PROTECTED)]
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"rollback protection could not be read ({exc}); no image was removed") from None
+        try: current=os.stat(state.db_path)
+        except FileNotFoundError: current=None
+        if current is None or (current.st_dev,current.st_ino)!=(pinned.st_dev,pinned.st_ino):
+            raise RuntimeError("UPT state database changed while rollback protection was read; no image was removed")
+    finally:
+        os.close(pin)
+    if any(not isinstance(value,str) or canonical_image_id(value)!=value for value in values):
+        raise RuntimeError("rollback protection contains a non-canonical image identity; no image was removed")
+    return frozenset(values)
 
 def cleanup_blocker(protection,image_id):
     """Why canonical ``image_id`` must not be removed, or None if eligible."""
-    exact,abbreviated=protection
     if canonical_image_id(image_id)!=image_id: return "INVALID IMAGE IDENTITY"
-    if image_id in exact: return "ROLLBACK PROTECTED"
-    if any(image_id[7:].startswith(prefix) for prefix in abbreviated): return "ROLLBACK PROTECTED (ABBREVIATED RECORD)"
-    return None
+    return "ROLLBACK PROTECTED" if image_id in protection else None
 
 def _utc(value=None):
     if value is None: return datetime.now(timezone.utc)

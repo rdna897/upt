@@ -240,14 +240,53 @@ class CleanupProtectionTests(unittest.TestCase):
         self.cleanup(docker)
         self.assertEqual(docker.removed, [collider])
 
-    def test_abbreviated_or_unrecognised_stored_identity_fails_closed(self):
+    def test_non_canonical_stored_identity_fails_closed(self):
+        # Retention matches stored IDs exactly, so cleanup must not proceed on
+        # a record that only cleanup could interpret (review finding).
+        for stored in (PROTECTED[7:19], PROTECTED[:19], PROTECTED.upper(), " " + PROTECTED, "app:1"):
+            self.sql("DELETE FROM protected_images")
+            self.sql("INSERT INTO protected_images(image_id,reason) VALUES(?,?)", (stored, "manual"))
+            self.assertIn("non-canonical", self.refused(_Docker([FREE])))
+
+    def test_main_does_not_reach_retention_when_stored_identity_is_abbreviated(self):
+        history = self.record(PROTECTED)
+        self.sql("UPDATE rollback_refs SET expired=1,purge_status='EXPIRED',created='2000-01-01 00:00:00' WHERE history_id=?", (history,))
         self.sql("INSERT INTO protected_images(image_id,reason) VALUES(?,?)", (PROTECTED[7:19], "manual"))
-        collider = PROTECTED[:19] + "f" * 52
-        docker = _Docker([PROTECTED, collider, FREE])
-        self.cleanup(docker)
-        self.assertEqual(docker.removed, [FREE])
-        self.sql("INSERT INTO protected_images(image_id,reason) VALUES(?,?)", ("app:1", "manual"))
-        self.assertIn("unrecognised", self.refused(_Docker([FREE])))
+        docker = _Docker([PROTECTED])
+        with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
+                patch("docker_update_manager.retention.run", docker), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = cli.main(["cleanup", "--yes"])
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertEqual(docker.removed, [])
+
+    def test_empty_or_uninitialised_database_fails_closed_without_initialising(self):
+        for content in (b"", None):
+            state = State(self.root / f"uninitialised-{content is None}")
+            state.root.mkdir()
+            if content is None:
+                import sqlite3
+                sqlite3.connect(state.db_path).close()  # valid SQLite, no UPT schema
+            else:
+                state.db_path.write_bytes(content)
+            with self.assertRaisesRegex(RuntimeError, "not initialised"):
+                cleanup_protection(state)
+            with state.db_path.open("rb") as f:
+                self.assertEqual(f.read(), b"")
+
+    def test_database_replaced_during_verification_fails_closed(self):
+        self.record(PROTECTED)
+        real = State.ensure_compatible
+
+        def replace_then_check(state):
+            os.replace(state.db_path, state.root / "moved.sqlite3")
+            for suffix in ("-wal", "-shm"):
+                Path(str(state.db_path) + suffix).unlink(missing_ok=True)
+            state._schema_ready = False
+            return real(state)  # recreates an empty, compatible database
+        with patch.object(State, "ensure_compatible", replace_then_check):
+            with self.assertRaisesRegex(RuntimeError, "changed while"):
+                cleanup_protection(self.state)
 
     def test_dry_run_lists_only_eligible_images_and_mutates_nothing(self):
         self.record(PROTECTED)
@@ -268,8 +307,8 @@ class CleanupProtectionTests(unittest.TestCase):
         self.assertEqual(canonical_image_id(" " + PROTECTED.upper().replace("SHA256", "SHA256") + "\n"), PROTECTED)
         for value in (None, 12, PROTECTED[7:], PROTECTED[:19], "sha256:", PROTECTED + "0"):
             self.assertIsNone(canonical_image_id(value))
-        self.assertEqual(cleanup_blocker((set(), set()), PROTECTED[:19]), "INVALID IMAGE IDENTITY")
-        self.assertIsNone(cleanup_blocker(({PROTECTED}, set()), FREE))
+        self.assertEqual(cleanup_blocker(frozenset(), PROTECTED[:19]), "INVALID IMAGE IDENTITY")
+        self.assertIsNone(cleanup_blocker(frozenset({PROTECTED}), FREE))
 
 
 if __name__ == "__main__":
