@@ -46,7 +46,7 @@ def canonical_image_id(value):
     text=value.strip().lower()
     return text if _IMAGE_ID.fullmatch(text) else None
 
-_REFUSED="no image was removed"
+_REFUSED="refusing to remove images"
 
 class CleanupState:
     """The verified state database for one dangling-image cleanup run.
@@ -278,7 +278,7 @@ def _container_image_ids():
     try: return {x.get("Image") for x in json.loads(run(["docker","inspect",*ids],timeout=60)) if x.get("Image")}
     except Exception: return set()
 
-def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now=None,service=None,stack=None,override_protection=False,all_protected=False):
+def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now=None,service=None,stack=None,override_protection=False,all_protected=False,revalidate=None):
     if not dry_run: _migrate_refs(state)
     now=_utc(now); inv=inventory(cfg,state,now,image_details=True); expired_files=[x for x in inv["artifacts"]+inv["logs"] if x["expired"]]
     if all_protected and service: raise ValueError("--all cannot be combined with --service")
@@ -380,6 +380,9 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
                                              "service":image_points[0].get("service"),"reclaimable":max((p.get("potential_reclaimable",0) for p in image_points),default=0),
                                              "action":planned})
             reporter.advance(index,task_total,image_id[:19],action); continue
+        # Optional caller check (``upt cleanup``'s pinned state); raising
+        # stops the run before this removal and is deliberately not caught.
+        if revalidate: revalidate()
         terminal=None
         try:
             run(["docker","image","rm",image_id],timeout=300)

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, difflib, json, os, platform, shutil, signal, sys
+import argparse, difflib, json, os, platform, shutil, signal, sqlite3, sys
 from functools import partial
 from pathlib import Path
 import yaml
@@ -564,9 +564,11 @@ def main(argv=None):
                 if significant: quick_snapshot(state,kind=f"before-{args.command}",reporter=NULL_REPORTER)
                 result=execute(args,p,cfg,state,reporter)
                 if significant: quick_snapshot(state,kind=f"after-{args.command}",reporter=NULL_REPORTER)
-                # The retention pass below must act on the same verified state.
-                if args.command=="cleanup": args.cleanup_state.protection()
-                retained=retention_cleanup(cfg,state,reporter=NULL_REPORTER,automatic=True)
+                # The retention pass below must act on the same verified state,
+                # rechecked before each of its removals too.
+                revalidate=args.cleanup_state.protection if args.command=="cleanup" else None
+                if revalidate: revalidate()
+                retained=retention_cleanup(cfg,state,reporter=NULL_REPORTER,automatic=True,revalidate=revalidate)
                 if retained.get("files_removed") or retained.get("images_removed") or retained.get("images_absent"):
                     print(f"\nRetention cleanup: {retained['files_removed']} artefact(s), {retained['images_removed']} image(s), {retained.get('images_absent',0)} absent image(s) reconciled, {human_size(retained['reclaimed'])} reclaimed.")
                 if retained.get("failures"):
@@ -575,6 +577,10 @@ def main(argv=None):
         return execute(args,p,cfg,state,reporter)
     except KeyboardInterrupt: print("\nInterrupted safely; completed backups were preserved.",file=sys.stderr); return 130
     except (ValueError,RuntimeError,CommandError,yaml.YAMLError) as e: print(f"Error: {e}",file=sys.stderr); return EXIT_FATAL
+    except (sqlite3.Error,OSError) as e:
+        # Cleanup refuses on any state failure; other commands keep their behaviour.
+        if getattr(locals().get('args'),"command",None)!="cleanup": raise
+        print(f"Error: UPT state could not be verified ({type(e).__name__}); refusing to remove images",file=sys.stderr); return EXIT_FATAL
     finally:
         if 'reporter' in locals(): reporter.close()
         if getattr(locals().get('args'),"cleanup_state",None): args.cleanup_state.close()

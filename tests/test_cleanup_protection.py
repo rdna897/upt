@@ -19,6 +19,7 @@ from sqlite_faults import select_from, sqlite_fault
 from docker_update_manager import cli
 from docker_update_manager.retention import CleanupState, canonical_image_id, cleanup_blocker
 from docker_update_manager.state import State
+from docker_update_manager.system import CommandError
 
 PROTECTED = "sha256:a1b2c3d4e5f6" + "0" * 52
 FREE = "sha256:" + "c" * 64
@@ -388,6 +389,53 @@ class CleanupProtectionTests(unittest.TestCase):
         self.assertEqual(code, cli.EXIT_FATAL)
         self.assertEqual(docker.removed, [FREE])
         retention.assert_not_called()
+
+    def test_retention_pass_revalidates_pinned_state_before_each_removal(self):
+        self.record(PROTECTED, service="app")
+        self.record(OTHER, service="worker")
+        # Both refs are past retention; OTHER also has unresolved manual protection.
+        self.sql("UPDATE rollback_refs SET created='2000-01-01 00:00:00'")
+        self.sql("UPDATE protected_images SET history_id=NULL WHERE image_id=?", (OTHER,))
+        removed = []
+
+        def docker(args, **kwargs):
+            if args[:3] == ["docker", "image", "ls"]:
+                return "\n"
+            if args[:3] == ["docker", "image", "rm"]:
+                removed.append(args[-1])
+                # Another valid, empty database appears mid-retention.
+                os.replace(self.state.db_path, self.root / "moved.sqlite3")
+                for suffix in ("-wal", "-shm"):
+                    Path(str(self.state.db_path) + suffix).unlink(missing_ok=True)
+                State(self.state.root).ensure_compatible()
+                return ""
+            if args[:3] == ["docker", "ps", "-aq"]:
+                return ""
+            raise CommandError("not mocked")
+        with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
+                patch("docker_update_manager.retention.run", docker), \
+                patch.object(cli, "quick_snapshot", lambda *a, **k: None), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = cli.main(["cleanup", "--yes"])
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertEqual(removed, [PROTECTED])  # OTHER's removal was refused
+        self.assertNotIn(OTHER, removed)
+
+    def test_state_errors_during_cleanup_are_fatal_not_tracebacks(self):
+        real = State.ensure_compatible
+
+        def vanish(state):
+            State.ensure_compatible = real
+            state.db_path.unlink()
+            return real(state)
+        docker = _Docker([FREE])
+        with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
+                patch.object(State, "ensure_compatible", vanish), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = cli.main(["cleanup", "--yes"])
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertEqual(docker.calls, [])
+        self.assertFalse(self.state.db_path.exists())
 
     def test_web_state_supports_existing_only_reads(self):
         from docker_update_manager.webstate import WebState
