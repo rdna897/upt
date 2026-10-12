@@ -544,7 +544,9 @@ def main(argv=None):
     try:
         args=p.parse_args(argv)
         if argv and argv[0] in {"-h","--help"}: print_main_help(p); return 0
-        cfg=Config(); state=State(cfg.state_dir)
+        # Cleanup must never create or initialise state: an empty database would
+        # report no rollback protection, on this run or a retry.
+        cfg=Config(); state=State(cfg.state_dir,require_existing=args.command=="cleanup")
         json_mode=bool(getattr(args,"json",False)); quiet=bool(getattr(args,"quiet",False))
         enabled=not bool(getattr(args,"no_progress",False)) and not quiet and not json_mode
         force=True if bool(getattr(args,"progress",False)) else None

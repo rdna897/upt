@@ -171,7 +171,7 @@ class State:
     supports_service_verification = True
     core_schema_identity = CORE_SCHEMA_IDENTITY
 
-    def __init__(self, root: Path, *, quiescent_transition=False):
+    def __init__(self, root: Path, *, quiescent_transition=False, require_existing=False):
         self.root = Path(root)
         self.db_path = self.root / "history.sqlite3"
         self._schema_lock = threading.Lock()
@@ -180,6 +180,9 @@ class State:
         self._quiescent_transition = quiescent_transition
         # Set once this instance initialises a database that had no schema.
         self.created_schema = False
+        # Never create or initialise a database: only open and migrate one
+        # that already has a schema (fail-closed safety commands).
+        self._require_existing = require_existing
 
     def _new_connection(self, timeout=None, *, existing=False):
         """Open a configured connection after ensuring its containing directory.
@@ -188,7 +191,7 @@ class State:
         ``existing`` opens only an existing database file and never creates one.
         """
         timeout = sqlite_timeout(timeout)
-        if existing:
+        if existing or self._require_existing:
             connection = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=rw", uri=True, timeout=timeout)
         else:
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -245,11 +248,15 @@ class State:
             self._schema_ready = False
             connection = self._new_connection(timeout=timeout)
             try:
+                if self._require_existing:
+                    self._require_schema_table(connection)
                 # WAL is configured before the migration transaction. Normal
                 # reads then use deferred read transactions and never reserve
                 # the single SQLite writer slot.
                 connection.execute("PRAGMA journal_mode=WAL")
                 connection.execute("BEGIN IMMEDIATE")
+                if self._require_existing:
+                    self._require_schema_table(connection)
                 old = connection.execute("SELECT name FROM sqlite_master WHERE name='schema_version'").fetchone()
                 version = connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone() if old else None
                 if self.core_schema_identity is not None and version and int(version[0]) == 8 and not self._quiescent_transition:
@@ -272,6 +279,11 @@ class State:
                 raise
             finally:
                 connection.close()
+
+    @staticmethod
+    def _require_schema_table(connection):
+        if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='schema_version'").fetchone():
+            raise RuntimeError("UPT state database is not initialised; refusing to initialise it")
 
     @contextmanager
     def connect(self):

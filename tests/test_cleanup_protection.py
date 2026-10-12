@@ -6,6 +6,7 @@ import _upt_isolation  # noqa: F401 - must stay first; see scripts/run_tests.py
 
 import io
 import os
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -218,7 +219,7 @@ class CleanupProtectionTests(unittest.TestCase):
     def test_main_reports_state_read_failure_as_fatal(self):
         docker = _Docker([FREE])
         with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
-                patch.object(cli, "State", lambda root: self.state), \
+                patch.object(cli, "State", lambda root, **options: self.state), \
                 sqlite_fault(self.state, select_from("rollback_refs"), mode="read_failure", times=5), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             code = cli.main(["cleanup", "--dry-run"])
@@ -266,7 +267,6 @@ class CleanupProtectionTests(unittest.TestCase):
             state = State(self.root / f"uninitialised-{content is None}")
             state.root.mkdir()
             if content is None:
-                import sqlite3
                 sqlite3.connect(state.db_path).close()  # valid SQLite, no UPT schema
             else:
                 state.db_path.write_bytes(content)
@@ -310,13 +310,36 @@ class CleanupProtectionTests(unittest.TestCase):
                 f.truncate(0)
             return real(state)
         docker = _Docker([PROTECTED])
+        codes = []
         with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
                 patch("docker_update_manager.retention.run", docker), \
                 patch.object(State, "ensure_compatible", truncate_then_check), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            code = cli.main(["cleanup", "--yes"])
-        self.assertEqual(code, cli.EXIT_FATAL)
+            codes.append(cli.main(["cleanup", "--yes"]))
+            # The refusal must not leave a valid empty database for a retry.
+            self.assertEqual(self.state.db_path.stat().st_size, 0)
+            codes.append(cli.main(["cleanup", "--yes"]))
+        self.assertEqual(codes, [cli.EXIT_FATAL, cli.EXIT_FATAL])
+        self.assertEqual(self.state.db_path.stat().st_size, 0)
         self.assertEqual(docker.removed, [])
+
+    def test_existing_only_state_never_creates_or_initialises(self):
+        missing = State(self.root / "absent", require_existing=True)
+        with self.assertRaises(sqlite3.OperationalError):
+            missing.ensure_compatible()
+        self.assertFalse(missing.db_path.exists())
+        empty = State(self.root / "empty", require_existing=True)
+        empty.root.mkdir()
+        empty.db_path.write_bytes(b"")
+        with self.assertRaisesRegex(RuntimeError, "not initialised"):
+            empty.ensure_compatible()
+        with self.assertRaisesRegex(RuntimeError, "not initialised"):
+            with empty.connect():
+                pass
+        self.assertEqual(empty.db_path.stat().st_size, 0)
+        existing = State(self.state.root, require_existing=True)
+        existing.ensure_compatible()
+        self.assertFalse(existing.created_schema)
 
     def test_main_does_not_reach_retention_with_expired_abbreviated_ref(self):
         self.record(PROTECTED)  # active canonical ref
