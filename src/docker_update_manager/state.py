@@ -282,7 +282,13 @@ class State:
 
     @staticmethod
     def _require_schema_table(connection):
-        if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='schema_version'").fetchone():
+        # Real state of any version, including unversioned legacy state, has
+        # these tables; a version table must hold one positive version. Any
+        # stub would otherwise be "migrated" into an empty database.
+        names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        versions = [tuple(row) for row in connection.execute("SELECT version FROM schema_version")] if "schema_version" in names else None
+        if (not {"history", "protected_images", "rollback_refs"} <= names
+                or versions is not None and (len(versions) != 1 or type(versions[0][0]) is not int or versions[0][0] < 1)):
             raise RuntimeError("UPT state database is not initialised; refusing to initialise it")
 
     @contextmanager

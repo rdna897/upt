@@ -323,6 +323,33 @@ class CleanupProtectionTests(unittest.TestCase):
         self.assertEqual(self.state.db_path.stat().st_size, 0)
         self.assertEqual(docker.removed, [])
 
+    def test_stub_schema_is_never_initialised_and_retry_still_refuses(self):
+        import sqlite3 as sql
+        stubs = {
+            "no-row": "CREATE TABLE schema_version(version INTEGER)",
+            "zero": "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(0)",
+            "negative": "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(-1)",
+            "text": "CREATE TABLE schema_version(version TEXT); INSERT INTO schema_version VALUES('9')",
+            "two-rows": "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(9),(9)",
+            "no-tables": "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(9)",
+        }
+        for name, script in stubs.items():
+            root = self.root / f"stub-{name}"
+            root.mkdir()
+            with sql.connect(root / "history.sqlite3") as c:
+                c.executescript(script)
+            before = (root / "history.sqlite3").read_bytes()
+            docker = _Docker([PROTECTED])
+            codes = []
+            with patch.dict(os.environ, {"UPT_STATE_DIR": str(root)}), patch.object(cli, "run", docker), \
+                    patch("docker_update_manager.retention.run", docker), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                for _ in range(2):
+                    codes.append(cli.main(["cleanup", "--yes"]))
+            self.assertEqual(codes, [cli.EXIT_FATAL, cli.EXIT_FATAL], name)
+            self.assertEqual((root / "history.sqlite3").read_bytes(), before, name)
+            self.assertEqual(docker.removed, [], name)
+
     def test_existing_only_state_never_creates_or_initialises(self):
         missing = State(self.root / "absent", require_existing=True)
         with self.assertRaises(sqlite3.OperationalError):
