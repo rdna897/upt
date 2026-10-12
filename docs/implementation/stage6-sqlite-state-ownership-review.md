@@ -229,7 +229,7 @@ Stage 4 specification work may proceed in parallel with separately approved corr
 
 ## Independent review record
 
-GPT-6.1-Sol (Codex, extra-high reasoning), read-only, round 1: **request changes**, no Blocker. It independently confirmed: no nested write transactions; the web process uses a separate, path-validated `WebState`; R1 and the guarded R2 behaviour; the Compose history retry; schema refusal; and runtime ordering protection. Its findings, all verified against source and incorporated:
+Independent technical review, read-only, round 1: **request changes**, no Blocker. It independently confirmed: no nested write transactions; the web process uses a separate, path-validated `WebState`; R1 and the guarded R2 behaviour; the Compose history retry; schema refusal; and runtime ordering protection. Its findings, all verified against source and incorporated:
 
 - (High) rollback and terminal-publication completion failures were missing → S6-R1b, R3 and G2 extended;
 - (Medium) incomplete direct-SQL inventory (`compose_recovery_retention.py`, receipt and disk-snapshot deletion, `compose_bootstrap.py` reads `operation_runs`) → §3 corrected; SQL ownership distinguished from transaction ownership;

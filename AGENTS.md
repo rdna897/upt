@@ -15,6 +15,11 @@ This repository (`rdna897/upt`) is the canonical, public development source for 
 
 Before pushing: inspect the complete diff, newly added files and test fixtures for private addresses, hostnames, internal paths, tokens, credentials, session data, CI runner identities, infrastructure details and unapproved third-party material. Use invented, generic synthetic examples. Review GitHub Actions logs, artefacts and job names as potential publication surfaces. Never assume content is safe merely because it previously existed in another repository.
 
+## Public-facing review attribution
+
+- Keep PR and issue titles, descriptions, comments, code-review summaries and public documentation tool-neutral. Credit roles such as “independent technical reviewer” and preserve findings, evidence, test results, exact commits and decision owners instead of naming the assistant or model used.
+- Mention a specific external model, provider or tool only when its identity is technically necessary to reproduce or assess a behaviour. Never rewrite published Git history or alter evidence solely to remove attribution.
+
 ## Testing and efficient CI
 
 - Run repository test harnesses in their isolation mode; do not run tests against production Docker or live network resources. Keep test-created threads and subprocesses bounded, joined and cleaned up.
