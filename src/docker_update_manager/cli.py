@@ -19,7 +19,7 @@ from .progress import Reporter, NULL_REPORTER
 from .conversion import generate_conversion, deploy_conversion, rollback_conversion, default_stack_path
 from . import diskcli
 from .diskdiag import fs_metrics, docker_df, container_logs, deleted_open, quick_snapshot
-from .retention import inventory as retention_inventory, cleanup as retention_cleanup, rollback_points, canonical_image_id, cleanup_protection, cleanup_blocker
+from .retention import inventory as retention_inventory, cleanup as retention_cleanup, rollback_points, canonical_image_id, CleanupState, cleanup_blocker
 from .removal import remove_service
 from .reconciliation import queue_agent_project_refresh, queue_agent_verification
 
@@ -416,12 +416,18 @@ def image_report(state):
     table([(x.get("Repository"),x.get("Tag"),short(x.get("ID")),"ROLLBACK PROTECTED" if x.get("ID") in protected else "local") for x in data],["REPOSITORY","TAG","IMAGE ID","RELATION"])
 
 def cleanup(state,args,reporter=NULL_REPORTER):
+    pinned=getattr(args,"cleanup_state",None)
+    if pinned is None:
+        with CleanupState(state) as pinned: return _cleanup(pinned,args,reporter)
+    return _cleanup(pinned,args,reporter)
+
+def _cleanup(pinned,args,reporter):
     reporter.start("cleanup","Analysing Docker storage")
     # Full IDs only: abbreviated IDs never match stored protection (issue #17).
     listed=run(["docker","image","ls","-q","--no-trunc","--filter","dangling=true"]).split()
     invalid=[x for x in dict.fromkeys(listed) if canonical_image_id(x) is None]
     dangling=list(dict.fromkeys(x for x in map(canonical_image_id,listed) if x))
-    protection=cleanup_protection(state)
+    protection=pinned.protection()
     protected=[(x,r) for x in dangling if (r:=cleanup_blocker(protection,x))]
     candidates=[x for x in dangling if not cleanup_blocker(protection,x)]
     print(f"Dangling image candidates: {len(candidates)}\nProtected rollback images: {len(protected)}\nInvalid image identities: {len(invalid)}")
@@ -440,7 +446,7 @@ def cleanup(state,args,reporter=NULL_REPORTER):
     try:
         for i,image in enumerate(candidates,1):
             # Fresh short read before each removal; no SQLite transaction spans Docker.
-            reason=cleanup_blocker(cleanup_protection(state),image)
+            reason=cleanup_blocker(pinned.protection(),image)
             if reason:
                 skipped.append(image); reporter.warning("SKIPPED - "+reason,short(image)); print(f"  skipped {image}: {reason}")
                 reporter.advance(i,len(candidates),short(image),"skipped"); continue
@@ -543,8 +549,11 @@ def main(argv=None):
         enabled=not bool(getattr(args,"no_progress",False)) and not quiet and not json_mode
         force=True if bool(getattr(args,"progress",False)) else None
         reporter=Reporter(enabled=enabled,force=force,stream=(sys.stderr if json_mode else sys.stdout))
-        # ensure_compatible would create an empty database, hiding lost protection.
-        if args.command=="cleanup": cleanup_protection(state)
+        if args.command=="cleanup":
+            # Pin existing state first: ensure_compatible would create or
+            # initialise an empty database, hiding lost protection.
+            args.cleanup_state=CleanupState(state); state.ensure_compatible()
+            args.cleanup_state.protection()  # refuse before the lock, snapshots or Docker
         if args.command in MODIFYING and not bool(getattr(args,"dry_run",False)):
             # Before the lock, snapshots, backups or any Docker/source mutation.
             state.ensure_compatible()
@@ -564,6 +573,7 @@ def main(argv=None):
     except (ValueError,RuntimeError,CommandError,yaml.YAMLError) as e: print(f"Error: {e}",file=sys.stderr); return EXIT_FATAL
     finally:
         if 'reporter' in locals(): reporter.close()
+        if getattr(locals().get('args'),"cleanup_state",None): args.cleanup_state.close()
         signal.signal(signal.SIGTERM,old_term)
 
 if __name__=="__main__": raise SystemExit(main())

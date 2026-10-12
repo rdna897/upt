@@ -1,5 +1,6 @@
 """Retention for recovery artefacts owned exclusively by Docker Update Manager."""
 from __future__ import annotations
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json, os, re, shutil, sqlite3
 from pathlib import Path
@@ -45,47 +46,70 @@ def canonical_image_id(value):
     text=value.strip().lower()
     return text if _IMAGE_ID.fullmatch(text) else None
 
-def _require_initialised(path):
-    # mode=rw never creates a file, unlike State's lazy schema initialisation.
-    try:
-        c=sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw",uri=True)
-        try: row=c.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-        finally: c.close()
-    except sqlite3.Error: row=None
-    if row is None:
-        raise RuntimeError("UPT state database is not initialised; rollback protection cannot be verified, so no image was removed")
+_REFUSED="no image was removed"
 
-def cleanup_protection(state):
-    """Read the canonical IDs dangling-image cleanup must keep, failing closed.
+class CleanupState:
+    """The verified state database for one dangling-image cleanup run.
 
-    Missing, empty, uninitialised, unreadable, incompatible or replaced state
-    raises instead of returning an empty protection set, as does any stored
-    identity that is not exactly canonical: R10 retention matches stored IDs by
-    exact string, so a looser record would not protect the image from it.
+    Opening requires an existing, initialised database without creating or
+    initialising one, and holds a descriptor so the inode cannot be reused.
+    Every ``protection()`` read then refuses unless the same file is still in
+    place with the current schema, so a missing, emptied, replaced,
+    unreadable or incompatible database never yields an empty protection set.
     """
-    try: pin=os.open(state.db_path,os.O_RDONLY|os.O_CLOEXEC)
-    except FileNotFoundError:
-        raise RuntimeError("UPT state database is missing; rollback protection cannot be verified, so no image was removed") from None
-    try:
-        # The open descriptor keeps the inode alive, so a replaced database
-        # cannot reuse its identity before the final comparison.
-        pinned=os.fstat(pin)
-        _require_initialised(state.db_path)
+
+    def __init__(self,state):
+        self.state=state
+        try: self._fd=os.open(state.db_path,os.O_RDONLY|os.O_CLOEXEC)
+        except FileNotFoundError:
+            raise RuntimeError(f"UPT state database is missing; rollback protection cannot be verified, so {_REFUSED}") from None
         try:
-            # Re-checks schema version/identity even for a long-lived State.
-            state.ensure_compatible()
-            with state.read() as c: values=[row[0] for row in c.execute(_CLEANUP_PROTECTED)]
+            pinned=os.fstat(self._fd); self._identity=(pinned.st_dev,pinned.st_ino)
+            with self._read() as c: self._require_schema(c,current=False)
+        except BaseException:
+            os.close(self._fd); raise
+
+    def __enter__(self): return self
+    def __exit__(self,*exc): self.close()
+    def close(self):
+        if self._fd is not None: os.close(self._fd); self._fd=None
+
+    @contextmanager
+    def _read(self):
+        try:
+            with self.state.read_existing() as c: yield c
         except sqlite3.Error as exc:
-            raise RuntimeError(f"rollback protection could not be read ({exc}); no image was removed") from None
-        try: current=os.stat(state.db_path)
+            raise RuntimeError(f"rollback protection could not be read ({exc}); {_REFUSED}") from None
+
+    @staticmethod
+    def _require_schema(c,*,current):
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE name='schema_version'").fetchone():
+            raise RuntimeError(f"UPT state database is not initialised; rollback protection cannot be verified, so {_REFUSED}")
+        if not current: return
+        from .state import CORE_SCHEMA_IDENTITY, CORE_SCHEMA_VERSION
+        version=c.execute("SELECT version FROM schema_version").fetchall()
+        identity=[tuple(row) for row in c.execute("SELECT singleton,identity FROM core_schema_identity")] \
+            if c.execute("SELECT 1 FROM sqlite_master WHERE name='core_schema_identity'").fetchone() else []
+        if [tuple(row) for row in version]!=[(CORE_SCHEMA_VERSION,)] or identity!=[(1,CORE_SCHEMA_IDENTITY)]:
+            raise RuntimeError(f"UPT state database schema is not compatible with this cleanup; {_REFUSED}")
+
+    def protection(self):
+        """Canonical IDs cleanup must keep, from one short read (no Docker inside)."""
+        if self.state.created_schema:
+            raise RuntimeError(f"UPT state database was initialised during this run; rollback protection cannot be verified, so {_REFUSED}")
+        with self._read() as c:
+            self._require_schema(c,current=True)
+            values=[row[0] for row in c.execute(_CLEANUP_PROTECTED)]
+            # Retention matches stored IDs exactly, including expired refs, so
+            # any looser record anywhere could bypass this decision there.
+            recorded=[row[0] for row in c.execute("SELECT image_id FROM rollback_refs UNION ALL SELECT image_id FROM protected_images")]
+        try: current=os.stat(self.state.db_path)
         except FileNotFoundError: current=None
-        if current is None or (current.st_dev,current.st_ino)!=(pinned.st_dev,pinned.st_ino):
-            raise RuntimeError("UPT state database changed while rollback protection was read; no image was removed")
-    finally:
-        os.close(pin)
-    if any(not isinstance(value,str) or canonical_image_id(value)!=value for value in values):
-        raise RuntimeError("rollback protection contains a non-canonical image identity; no image was removed")
-    return frozenset(values)
+        if current is None or (current.st_dev,current.st_ino)!=self._identity:
+            raise RuntimeError(f"UPT state database was replaced during cleanup; {_REFUSED}")
+        if any(not isinstance(value,str) or canonical_image_id(value)!=value for value in recorded):
+            raise RuntimeError(f"rollback protection contains a non-canonical image identity; {_REFUSED}")
+        return frozenset(values)
 
 def cleanup_blocker(protection,image_id):
     """Why canonical ``image_id`` must not be removed, or None if eligible."""

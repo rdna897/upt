@@ -16,7 +16,7 @@ from unittest.mock import patch
 from sqlite_faults import select_from, sqlite_fault
 
 from docker_update_manager import cli
-from docker_update_manager.retention import canonical_image_id, cleanup_blocker, cleanup_protection
+from docker_update_manager.retention import CleanupState, canonical_image_id, cleanup_blocker
 from docker_update_manager.state import State
 
 PROTECTED = "sha256:a1b2c3d4e5f6" + "0" * 52
@@ -53,8 +53,9 @@ class CleanupProtectionTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        State(self.root / "state").ensure_compatible()
+        # A State that initialised the schema itself is refused by cleanup.
         self.state = State(self.root / "state")
-        self.state.ensure_compatible()
 
     def record(self, image_id, service="app", stack="s"):
         self.state.record(stack=stack, service=service, action="update", old_image=f"{service}:1",
@@ -193,7 +194,7 @@ class CleanupProtectionTests(unittest.TestCase):
     def test_missing_database_fails_closed_without_creating_it(self):
         state = State(self.root / "absent")
         with self.assertRaisesRegex(RuntimeError, "missing"):
-            cleanup_protection(state)
+            CleanupState(state)
         self.assertFalse(state.db_path.exists())
 
     def test_incompatible_database_fails_closed(self):
@@ -270,23 +271,64 @@ class CleanupProtectionTests(unittest.TestCase):
             else:
                 state.db_path.write_bytes(content)
             with self.assertRaisesRegex(RuntimeError, "not initialised"):
-                cleanup_protection(state)
+                CleanupState(state)
             with state.db_path.open("rb") as f:
                 self.assertEqual(f.read(), b"")
 
-    def test_database_replaced_during_verification_fails_closed(self):
+    def test_database_replaced_during_cleanup_fails_closed(self):
+        self.record(PROTECTED)
+        with CleanupState(self.state) as pinned:
+            self.assertEqual(pinned.protection(), {PROTECTED})
+            os.replace(self.state.db_path, self.root / "moved.sqlite3")
+            for suffix in ("-wal", "-shm"):
+                Path(str(self.state.db_path) + suffix).unlink(missing_ok=True)
+            State(self.state.root).ensure_compatible()  # another process recreates it
+            with self.assertRaisesRegex(RuntimeError, "replaced"):
+                pinned.protection()
+
+    def test_database_reinitialised_in_place_fails_closed(self):
+        self.record(PROTECTED)
+        with CleanupState(self.state) as pinned:
+            for suffix in ("-wal", "-shm"):
+                Path(str(self.state.db_path) + suffix).unlink(missing_ok=True)
+            with self.state.db_path.open("r+b") as f:
+                f.truncate(0)  # same inode
+            self.state._schema_ready = False
+            self.state.ensure_compatible()  # re-initialises the empty file
+            with self.assertRaisesRegex(RuntimeError, "initialised during this run"):
+                pinned.protection()
+
+    def test_main_refuses_when_state_is_emptied_before_compatibility_check(self):
         self.record(PROTECTED)
         real = State.ensure_compatible
 
-        def replace_then_check(state):
-            os.replace(state.db_path, state.root / "moved.sqlite3")
+        def truncate_then_check(state):
+            State.ensure_compatible = real  # only the first check races
             for suffix in ("-wal", "-shm"):
                 Path(str(state.db_path) + suffix).unlink(missing_ok=True)
-            state._schema_ready = False
-            return real(state)  # recreates an empty, compatible database
-        with patch.object(State, "ensure_compatible", replace_then_check):
-            with self.assertRaisesRegex(RuntimeError, "changed while"):
-                cleanup_protection(self.state)
+            with state.db_path.open("r+b") as f:
+                f.truncate(0)
+            return real(state)
+        docker = _Docker([PROTECTED])
+        with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
+                patch("docker_update_manager.retention.run", docker), \
+                patch.object(State, "ensure_compatible", truncate_then_check), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = cli.main(["cleanup", "--yes"])
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertEqual(docker.removed, [])
+
+    def test_main_does_not_reach_retention_with_expired_abbreviated_ref(self):
+        self.record(PROTECTED)  # active canonical ref
+        self.sql("INSERT INTO rollback_refs(history_id,image_id,expired,purge_status,created) VALUES(999,?,1,'EXPIRED','2000-01-01 00:00:00')", (PROTECTED[7:19],))
+        self.sql("INSERT INTO protected_images(image_id,reason,history_id) VALUES(?,?,999)", (PROTECTED[7:19], "rollback"))
+        docker = _Docker([PROTECTED])
+        with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
+                patch("docker_update_manager.retention.run", docker), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = cli.main(["cleanup", "--yes"])
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertEqual(docker.removed, [])
 
     def test_dry_run_lists_only_eligible_images_and_mutates_nothing(self):
         self.record(PROTECTED)

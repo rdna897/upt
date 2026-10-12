@@ -126,11 +126,11 @@ def sqlite_fault(state, match, *, mode="before_commit", times=1, message=None):
         "read_failure": "disk I/O error"}[mode])
     original = state._new_connection
 
-    def new_connection(timeout=None):
+    def new_connection(timeout=None, **options):
         fault.connection_timeouts.append(timeout)
         if fault.unavailable:
             raise sqlite3.OperationalError(fault.message)
-        return _Connection(original(timeout=timeout), fault)
+        return _Connection(original(timeout=timeout, **options), fault)
 
     with patch.object(state, "_new_connection", side_effect=new_connection):
         yield fault

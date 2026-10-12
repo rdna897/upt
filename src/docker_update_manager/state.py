@@ -178,15 +178,21 @@ class State:
         self._schema_ready = False
         self._schema_version = None
         self._quiescent_transition = quiescent_transition
+        # Set once this instance initialises a database that had no schema.
+        self.created_schema = False
 
-    def _new_connection(self, timeout=None):
+    def _new_connection(self, timeout=None, *, existing=False):
         """Open a configured connection after ensuring its containing directory.
 
         ``timeout`` bounds both the open and SQLite's busy wait (default 30 s).
+        ``existing`` opens only an existing database file and never creates one.
         """
         timeout = sqlite_timeout(timeout)
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        connection = sqlite3.connect(self.db_path, timeout=timeout)
+        if existing:
+            connection = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=rw", uri=True, timeout=timeout)
+        else:
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            connection = sqlite3.connect(self.db_path, timeout=timeout)
         connection.row_factory = sqlite3.Row
         os.chmod(self.db_path, 0o600)
         for suffix in ("-wal", "-shm"):
@@ -248,9 +254,11 @@ class State:
                 version = connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone() if old else None
                 if self.core_schema_identity is not None and version and int(version[0]) == 8 and not self._quiescent_transition:
                     raise RuntimeError("schema 8 to 9 requires the offline quiescent state transition")
+                created = not version
                 self._migrate(connection)
                 version = int(connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone()[0])
                 connection.commit()
+                self.created_schema = self.created_schema or created
                 for suffix in ("-wal", "-shm"):
                     sidecar = Path(str(self.db_path) + suffix)
                     try:
@@ -353,6 +361,21 @@ class State:
         """
         self._ensure_schema(timeout=timeout)
         c = self._new_connection(timeout=timeout)
+        try:
+            c.execute("BEGIN")
+            yield c
+        finally:
+            c.rollback()
+            c.close()
+
+    @contextmanager
+    def read_existing(self, *, timeout=None):
+        """Read transaction that never creates, initialises or migrates state.
+
+        For fail-closed safety checks: a missing database raises instead of
+        being replaced by an empty one. Callers must verify the schema.
+        """
+        c = self._new_connection(timeout=timeout, existing=True)
         try:
             c.execute("BEGIN")
             yield c
