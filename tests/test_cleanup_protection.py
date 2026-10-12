@@ -325,13 +325,17 @@ class CleanupProtectionTests(unittest.TestCase):
 
     def test_stub_schema_is_never_initialised_and_retry_still_refuses(self):
         import sqlite3 as sql
+        # Version cases carry the core tables so only version validation refuses them.
+        core = ("CREATE TABLE history(id INTEGER PRIMARY KEY); CREATE TABLE protected_images(image_id TEXT PRIMARY KEY); "
+                "CREATE TABLE rollback_refs(history_id INTEGER PRIMARY KEY, image_id TEXT); ")
         stubs = {
-            "no-row": "CREATE TABLE schema_version(version INTEGER)",
-            "zero": "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(0)",
-            "negative": "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(-1)",
-            "text": "CREATE TABLE schema_version(version TEXT); INSERT INTO schema_version VALUES('9')",
-            "two-rows": "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(9),(9)",
+            "no-row": core + "CREATE TABLE schema_version(version INTEGER)",
+            "zero": core + "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(0)",
+            "negative": core + "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(-1)",
+            "text": core + "CREATE TABLE schema_version(version TEXT); INSERT INTO schema_version VALUES('9')",
+            "two-rows": core + "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(9),(9)",
             "no-tables": "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(9)",
+            "partial-tables": "CREATE TABLE history(id INTEGER PRIMARY KEY); CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version VALUES(9)",
         }
         for name, script in stubs.items():
             root = self.root / f"stub-{name}"
