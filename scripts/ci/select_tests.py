@@ -76,7 +76,7 @@ WEB_TESTS = (
 CLI_TESTS = (
     "test_core", "test_discovery", "test_pin_history_image", "test_progress",
     "test_compose_namespace", "test_schema_compatibility_boundary",
-    "test_version_contract", "test_disk_retention",
+    "test_version_contract", "test_disk_retention", "test_cleanup_protection",
 )
 
 SRC = "src/docker_update_manager/"

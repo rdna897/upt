@@ -1,7 +1,7 @@
 """Retention for recovery artefacts owned exclusively by Docker Update Manager."""
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone
-import json, os, shutil, sqlite3
+import json, os, re, shutil, sqlite3
 from pathlib import Path
 from .diskdiag import du, parse_size
 from .progress import NULL_REPORTER
@@ -29,6 +29,58 @@ _UNRESOLVED_PROTECTION=(
     "SELECT 1 FROM protected_images p WHERE p.image_id=? "
     "AND NOT "+_matching_ref()+" AND NOT ("+_LEGACY_CANDIDATE+")"
 )
+# Dangling-image cleanup applies the same rules without migrating refs: every
+# active ref, and every protection its own ref has not resolved. The latter
+# includes NULL-history/manual/namespace rows and unmigrated legacy rows, which
+# retention would first turn into active refs.
+_CLEANUP_PROTECTED=(
+    "SELECT image_id FROM rollback_refs WHERE expired=0 "
+    "UNION SELECT p.image_id FROM protected_images p WHERE NOT "+_matching_ref()
+)
+_IMAGE_ID=re.compile(r"sha256:[0-9a-f]{64}")
+_HEX=re.compile(r"[0-9a-f]{1,64}")
+
+def canonical_image_id(value):
+    """Return ``sha256:<64 lowercase hex>``, or None for anything less exact."""
+    if not isinstance(value,str): return None
+    text=value.strip().lower()
+    return text if _IMAGE_ID.fullmatch(text) else None
+
+def cleanup_protection(state):
+    """Read dangling-cleanup protection in one short read, failing closed.
+
+    Returns ``(exact, abbreviated)``: canonical protected IDs, and hex prefixes
+    of stored IDs that are not canonical. An abbreviated record blocks every
+    image it could name. Missing, unreadable or incompatible state, or a stored
+    identity that is not an image ID at all, raises instead of returning an
+    empty protection set.
+    """
+    if not state.db_path.exists():
+        raise RuntimeError("UPT state database is missing; rollback protection cannot be verified, so no image was removed")
+    try:
+        # Re-checks schema version/identity even for a long-lived State.
+        state.ensure_compatible()
+        with state.read() as c: values=[row[0] for row in c.execute(_CLEANUP_PROTECTED)]
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"rollback protection could not be read ({exc}); no image was removed") from None
+    exact=set(); abbreviated=set()
+    for value in values:
+        canonical=canonical_image_id(value)
+        if canonical: exact.add(canonical); continue
+        text=value.strip().lower() if isinstance(value,str) else ""
+        text=text[7:] if text.startswith("sha256:") else text
+        if not _HEX.fullmatch(text):
+            raise RuntimeError("rollback protection contains an unrecognised image identity; no image was removed")
+        abbreviated.add(text)
+    return exact,abbreviated
+
+def cleanup_blocker(protection,image_id):
+    """Why canonical ``image_id`` must not be removed, or None if eligible."""
+    exact,abbreviated=protection
+    if canonical_image_id(image_id)!=image_id: return "INVALID IMAGE IDENTITY"
+    if image_id in exact: return "ROLLBACK PROTECTED"
+    if any(image_id[7:].startswith(prefix) for prefix in abbreviated): return "ROLLBACK PROTECTED (ABBREVIATED RECORD)"
+    return None
 
 def _utc(value=None):
     if value is None: return datetime.now(timezone.utc)
