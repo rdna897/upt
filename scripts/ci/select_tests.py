@@ -57,7 +57,7 @@ COMPOSE_TESTS = (
     "test_compose_apply", "test_compose_bootstrap", "test_compose_discard",
     "test_compose_namespace", "test_compose_namespace_apply",
     "test_compose_namespace_update", "test_compose_reconciliation",
-    "test_compose_recovery_retention", "test_conversion",
+    "test_compose_recovery_retention", "test_cleanup_protection", "test_conversion",
     "test_post_mutation_reconciliation", "test_same_project_baseline_reconciliation",
     "test_schema_compatibility_boundary", "test_state_rollback_compatibility",
     "test_web_operations", "test_web_rollback", "test_core", "test_pin_history_image",

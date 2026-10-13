@@ -282,13 +282,12 @@ class State:
 
     @staticmethod
     def _require_schema_table(connection):
-        # Real state of any version, including unversioned legacy state, has
-        # these tables; a version table must hold one positive version. Any
-        # stub would otherwise be "migrated" into an empty database.
+        # Existing-only state must already have version metadata. Ordinary
+        # State opening still supports unversioned legacy migrations.
         names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         versions = [tuple(row) for row in connection.execute("SELECT version FROM schema_version")] if "schema_version" in names else None
-        if (not {"history", "protected_images", "rollback_refs"} <= names
-                or versions is not None and (len(versions) != 1 or type(versions[0][0]) is not int or versions[0][0] < 1)):
+        if (not {"history", "protected_images", "rollback_refs", "schema_version"} <= names
+                or versions is None or len(versions) != 1 or type(versions[0][0]) is not int or versions[0][0] < 1):
             raise RuntimeError("UPT state database is not initialised; refusing to initialise it")
 
     @contextmanager
@@ -697,13 +696,14 @@ class State:
         with self.connect() as c:
             return c.execute("INSERT INTO disk_snapshots(kind,metrics) VALUES(?,?)", (kind, json.dumps(metrics, separators=(",", ":")))).lastrowid
 
-    def compact_if_needed(self, minimum_free_bytes=1024 * 1024, minimum_free_ratio=0.20):
+    def compact_if_needed(self, minimum_free_bytes=1024 * 1024, minimum_free_ratio=0.20, *, verify_connection=None):
         if not self.db_path.exists():
             if self._require_existing:
                 raise RuntimeError("UPT state database disappeared; refusing to continue")
             return {"compacted": False, "bytes_reclaimed": 0}
         before = self.db_path.stat().st_size
         with self.read() as c:
+            if verify_connection: verify_connection(c)
             page_size = c.execute("PRAGMA page_size").fetchone()[0]
             page_count = c.execute("PRAGMA page_count").fetchone()[0]
             free_pages = c.execute("PRAGMA freelist_count").fetchone()[0]
@@ -717,7 +717,11 @@ class State:
         vacuum = sqlite3.connect(target, timeout=30, isolation_level=None, uri=self._require_existing)
         try:
             vacuum.execute("PRAGMA busy_timeout=30000")
+            # VACUUM owns its transaction. Verify its actual connection, not
+            # a separate read that could authorise a replaced database.
+            if verify_connection: verify_connection(vacuum)
             vacuum.execute("VACUUM")
+            if verify_connection: verify_connection(vacuum)
         finally:
             vacuum.close()
         after = self.db_path.stat().st_size

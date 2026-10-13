@@ -83,7 +83,7 @@ def parser():
     add("health",COMMANDS["health"]); add("mutable",COMMANDS["mutable"]); add("pinned",COMMANDS["pinned"])
     q=add("compose",COMMANDS["compose"]); q.add_argument("service")
     q=add("images",COMMANDS["images"]); progress_options(q)
-    q=add("cleanup",COMMANDS["cleanup"],"Only dangling/unreferenced images are candidates; rollback images are protected. Images are matched by full ID and protection is rechecked before each removal. Nothing is removed if the UPT state database is missing or unreadable, or Docker returns an unrecognised image ID."); modifying(q); progress_options(q)
+    q=add("cleanup",COMMANDS["cleanup"],"Only dangling/unreferenced images are candidates; rollback images are protected. Images are matched by full ID and protection is rechecked before each removal. Automatic retention revalidates the same versioned state database before each recovery deletion and database mutation, including compaction. Verification failure stops cleanup. Nothing is removed if the UPT state database is missing, unversioned or unreadable, or Docker returns an unrecognised image ID."); modifying(q); progress_options(q)
     q=add("remove",COMMANDS["remove"],"Removes one Compose service container or standalone container. Data and configuration are preserved by default. --images also removes eligible images. --purge-data permanently deletes only named volumes, root-filesystem bind paths, and Compose/config sources that UPT can establish are not shared; ambiguous or shared resources are skipped.\n\nExamples:\n  upt remove flaresolverr --dry-run\n  upt remove flaresolverr --images --dry-run\n  upt remove flaresolverr --purge-data --dry-run\n  upt remove flaresolverr --images --purge-data\n\n--purge-data creates no recovery copy and requires typing DELETE SERVICE unless --yes is supplied. Always run the dry-run first."); q.add_argument("service"); q.add_argument("--images",action="store_true",help="also remove unused current and rollback images belonging to SERVICE"); q.add_argument("--purge-data","--data",dest="purge_data",action="store_true",help="permanently delete eligible unshared named volumes, bind data, and Compose/config sources"); modifying(q); progress_options(q)
     q=add("convert",COMMANDS["convert"],"Converted stacks are created under /root/SERVICE-stack by default (configurable with conversion_root). Default conversion pins the exact running digest. --track-tag preserves the original mutable tag for future scans while adoption still uses the running image. --deploy stops and renames the original container but does not delete it.\n\nExamples:\n  upt convert portainer --dry-run\n  upt convert portainer --track-tag --dry-run\n  upt convert portainer --track-tag --deploy\n  upt convert portainer --rollback"); q.add_argument("service"); modifying(q); progress_options(q); q.add_argument("--output",type=Path,help="override the default /root/SERVICE-stack directory"); q.add_argument("--deploy",action="store_true"); q.add_argument("--rollback",action="store_true"); q.add_argument("--replace-files",action="store_true"); q.add_argument("--track-tag",action="store_true",help="preserve the configured tag so future updates can be detected")
     q=add("disk",COMMANDS["disk"],"Actions: diagnose, growth, diff, history, largest, files, docker, containerd, containers, logs, journal, volumes, deleted, inodes, snapshot, watch"); diskcli.configure(q); progress_options(q)
@@ -564,13 +564,13 @@ def main(argv=None):
                 if significant: quick_snapshot(state,kind=f"before-{args.command}",reporter=NULL_REPORTER)
                 result=execute(args,p,cfg,state,reporter)
                 if significant: quick_snapshot(state,kind=f"after-{args.command}",reporter=NULL_REPORTER)
-                # The retention pass below must act on the same verified state,
-                # rechecked before each of its removals too.
-                revalidate=None
+                # Retention checks the pinned state at every mutation boundary,
+                # using its actual transaction for database writes.
+                cleanup_state=None
                 if args.command=="cleanup":
-                    args.cleanup_state.protection()
-                    revalidate=lambda image: cleanup_blocker(args.cleanup_state.protection(),image)
-                retained=retention_cleanup(cfg,state,reporter=NULL_REPORTER,automatic=True,revalidate=revalidate)
+                    cleanup_state=args.cleanup_state
+                    cleanup_state.protection()
+                retained=retention_cleanup(cfg,state,reporter=NULL_REPORTER,automatic=True,cleanup_state=cleanup_state)
                 if retained.get("files_removed") or retained.get("images_removed") or retained.get("images_absent"):
                     print(f"\nRetention cleanup: {retained['files_removed']} artefact(s), {retained['images_removed']} image(s), {retained.get('images_absent',0)} absent image(s) reconciled, {human_size(retained['reclaimed'])} reclaimed.")
                 if retained.get("failures"):

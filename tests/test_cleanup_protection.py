@@ -5,11 +5,12 @@ Docker is mocked and every database is a temporary SQLite file.
 import _upt_isolation  # noqa: F401 - must stay first; see scripts/run_tests.py
 
 import io
+import hashlib
 import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -18,7 +19,7 @@ from sqlite_faults import select_from, sqlite_fault
 
 from docker_update_manager import cli, retention
 from docker_update_manager.retention import CleanupState, canonical_image_id, cleanup_blocker
-from docker_update_manager.state import State
+from docker_update_manager.state import State, CORE_SCHEMA_VERSION, LEGACY_SCHEMA
 from docker_update_manager.system import CommandError
 
 PROTECTED = "sha256:a1b2c3d4e5f6" + "0" * 52
@@ -520,6 +521,398 @@ class CleanupProtectionTests(unittest.TestCase):
         existing = State(self.state.root, require_existing=True)
         existing.ensure_compatible()
         self.assertFalse(existing.created_schema)
+
+    def retention_fixture(self):
+        """Expired legacy/ref rows, audit data and two synthetic recovery files."""
+        legacy = self.record(PROTECTED)
+        self.record(OTHER, service="worker")
+        self.sql("DELETE FROM rollback_refs WHERE history_id=?", (legacy,))
+        self.sql("UPDATE protected_images SET created='2000-01-01 00:00:00'")
+        self.sql("UPDATE rollback_refs SET created='2000-01-01 00:00:00'")
+        self.sql("UPDATE history SET timestamp='2000-01-01 00:00:00'")
+        self.state.save_disk_snapshot("synthetic", {})
+        self.sql("UPDATE disk_snapshots SET timestamp='2000-01-01 00:00:00'")
+        paths = [self.state.root / "backups" / name for name in ("first", "second")]
+        paths[0].parent.mkdir()
+        for path in paths:
+            path.write_text("synthetic recovery evidence")
+            os.utime(path, (0, 0))
+        self.replacement = self.root / "replacement.sqlite3"
+        with closing(sqlite3.connect(self.state.db_path)) as source, closing(sqlite3.connect(self.replacement)) as target:
+            source.backup(target)
+        self.replacement_rows = self.database_rows(self.replacement)
+        return paths
+
+    @staticmethod
+    def database_rows(path):
+        with closing(sqlite3.connect(path)) as c:
+            return {name: c.execute(f"SELECT * FROM {name}").fetchall()
+                    for name in ("history", "protected_images", "rollback_refs", "disk_snapshots", "compose_recovery_receipts")}
+
+    def replace_retention_state(self):
+        os.replace(self.state.db_path, self.root / "displaced.sqlite3")
+        for suffix in ("-wal", "-shm"):
+            Path(str(self.state.db_path) + suffix).unlink(missing_ok=True)
+        os.replace(self.replacement, self.state.db_path)
+
+    def automatic_retention(self, on_rm=None):
+        """Exercise the actual CLI wiring with no snapshots or live Docker."""
+        docker = _Docker([], on_rm=on_rm)
+        cfg = SimpleNamespace(state_dir=self.state.root, log_dir=self.root / "logs", data={"retention": {"recovery_days": 7}})
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(cli, "Config", return_value=cfg), patch.object(cli, "run", docker), \
+                patch.object(cli, "quick_snapshot"), patch.object(retention, "run", docker), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(["cleanup", "--yes", "--no-progress"])
+        return code, docker, err.getvalue()
+
+    def assert_retention_refused(self, result):
+        code, docker, error = result
+        self.assertEqual(code, cli.EXIT_FATAL, error)
+        self.assertIn("replaced", error)
+        self.assertEqual(docker.removed, [])
+        self.assertEqual(self.database_rows(self.state.db_path), self.replacement_rows)
+
+    def test_retention_inventory_replacement_preserves_all_recovery_evidence(self):
+        paths = self.retention_fixture()
+        real_inventory = retention.inventory
+
+        def inventory_then_replace(*args, **kwargs):
+            result = real_inventory(*args, **kwargs)
+            self.replace_retention_state()
+            return result
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(retention, "inventory", side_effect=inventory_then_replace), \
+                patch.object(retention, "_migrate_refs", wraps=retention._migrate_refs) as migrate:
+            self.assert_retention_refused(self.automatic_retention())
+        migrate.assert_not_called()
+        self.assertTrue(all(path.exists() for path in paths))
+
+    def test_retention_accounting_replacement_prevents_migration_expiry_and_deletion(self):
+        paths = self.retention_fixture()
+
+        def accounting():
+            # The callback runs after the rollback SELECT snapshot is closed.
+            # A distinct writer can commit here before replacing the database.
+            with State(self.state.root).connect() as c:
+                c.execute("UPDATE disk_snapshots SET kind='accounting-writer'")
+            self.replace_retention_state()
+            return {}
+
+        with patch.object(retention, "_docker_image_accounting", side_effect=accounting), \
+                patch.object(retention, "_container_image_ids", return_value=set()):
+            self.assert_retention_refused(self.automatic_retention())
+        self.assertTrue(all(path.exists() for path in paths))
+
+    def test_retention_replacement_before_expiry_preserves_reference_state(self):
+        self.retention_fixture()
+
+        def accounting_for_containers():
+            self.replace_retention_state()
+            return set()
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", side_effect=accounting_for_containers):
+            self.assert_retention_refused(self.automatic_retention())
+
+    def test_retention_revalidates_between_individual_recovery_deletions(self):
+        paths = self.retention_fixture()
+        removed = []
+        real_unlink = Path.unlink
+
+        def unlink_then_replace(path, *args, **kwargs):
+            result = real_unlink(path, *args, **kwargs)
+            if path in paths:
+                removed.append(path)
+                if len(removed) == 1:
+                    self.replace_retention_state()
+            return result
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(Path, "unlink", unlink_then_replace):
+            self.assert_retention_refused(self.automatic_retention())
+        self.assertEqual(len(removed), 1)
+        self.assertTrue(next(path for path in paths if path != removed[0]).exists())
+
+    def test_retention_replacement_before_final_pruning_preserves_metadata(self):
+        self.retention_fixture()
+
+        def skip_then_replace(state, image_id, **kwargs):
+            if self.replacement.exists():
+                self.replace_retention_state()
+            return "SKIPPED - UNRESOLVED PROTECTION"
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(retention, "_removal_blocker", side_effect=skip_then_replace), \
+                patch.object(State, "compact_if_needed") as compact:
+            self.assert_retention_refused(self.automatic_retention())
+        compact.assert_not_called()
+
+    def retention_transaction_replacement(self, boundary):
+        # 1: legacy migration, 2: ref expiry, 3: final pruning (images skipped).
+        self.retention_fixture()
+        real_connect = State.connect
+        transactions = []
+
+        @contextmanager
+        def replace_before_transaction(state):
+            transactions.append(state)
+            if len(transactions) == boundary:
+                # The separate pinned read has already succeeded.
+                self.replace_retention_state()
+            with real_connect(state) as c:
+                yield c
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(retention, "_removal_blocker", return_value="SKIPPED"), \
+                patch.object(State, "connect", replace_before_transaction):
+            self.assert_retention_refused(self.automatic_retention())
+        self.assertEqual(len(transactions), boundary)
+
+    def test_retention_checks_migration_transaction_after_verification(self):
+        self.retention_transaction_replacement(1)
+
+    def test_retention_checks_expiry_transaction_after_verification(self):
+        self.retention_transaction_replacement(2)
+
+    def test_retention_checks_pruning_transaction_after_verification(self):
+        self.retention_transaction_replacement(3)
+
+    def test_retention_checks_protection_inside_write_transaction(self):
+        paths = self.retention_fixture()
+        before = self.database_rows(self.state.db_path)
+        real_connect = State.connect
+
+        @contextmanager
+        def invalidate_transaction(state):
+            with real_connect(state) as c:
+                c.execute("UPDATE protected_images SET image_id='short-id' WHERE image_id=?", (PROTECTED,))
+                yield c
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(State, "connect", invalidate_transaction):
+            code, docker, error = self.automatic_retention()
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertIn("non-canonical", error)
+        self.assertEqual(docker.removed, [])
+        self.assertEqual(self.database_rows(self.state.db_path), before)
+        self.assertTrue(all(path.exists() for path in paths))
+
+    def test_retention_checks_before_commit_and_rolls_back_pruning(self):
+        self.retention_fixture()
+        real_connect = State.connect
+        pruning_rows = []
+
+        # Invalidate during the transaction body, before CleanupState's exit
+        # check (rather than after its context manager has already exited).
+        class PruningConnection:
+            def __init__(self, c): self.c = c
+            def __getattr__(self, name): return getattr(self.c, name)
+            def execute(self, sql, params=()):
+                result = self.c.execute(sql, params)
+                if sql == "PRAGMA optimize":
+                    self.c.execute("INSERT INTO protected_images(image_id,reason) VALUES('short-id','synthetic invalidation')")
+                return result
+
+        @contextmanager
+        def pruning_connection(state):
+            with real_connect(state) as c:
+                # Record the committed state before the pruning transaction.
+                pruning_rows[:] = [self.database_rows(self.state.db_path)]
+                yield PruningConnection(c)
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(retention, "_removal_blocker", return_value="SKIPPED"), \
+                patch.object(State, "connect", pruning_connection):
+            code, docker, error = self.automatic_retention()
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertIn("non-canonical", error)
+        self.assertEqual(docker.removed, [])
+        self.assertEqual(self.database_rows(self.state.db_path), pruning_rows[0])
+
+    def test_retention_replacement_after_pruning_prevents_compaction(self):
+        self.retention_fixture()
+        real_connect = State.connect
+        transactions = []
+
+        @contextmanager
+        def replace_after_pruning(state):
+            transactions.append(state)
+            with real_connect(state) as c:
+                yield c
+            if len(transactions) == 3:
+                self.replace_retention_state()
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(retention, "_removal_blocker", return_value="SKIPPED"), \
+                patch.object(State, "connect", replace_after_pruning), \
+                patch.object(State, "compact_if_needed") as compact:
+            self.assert_retention_refused(self.automatic_retention())
+        compact.assert_not_called()
+
+    def test_retention_compaction_checks_the_actual_vacuum_connection(self):
+        self.retention_fixture()
+        with self.state.connect() as c:
+            c.execute("CREATE TABLE filler(x)")
+            c.executemany("INSERT INTO filler VALUES(?)", [("x" * 4000,)] * 600)
+        self.sql("DROP TABLE filler")
+        real_sqlite_connect = sqlite3.connect
+        vacuum_statements = []
+
+        class VacuumConnection(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):
+                if sql == "VACUUM": vacuum_statements.append(sql)
+                return super().execute(sql, *args, **kwargs)
+
+        def replace_before_vacuum(*args, **kwargs):
+            if kwargs.get("isolation_level", "default") is None:
+                self.replace_retention_state()
+                kwargs["factory"] = VacuumConnection
+            return real_sqlite_connect(*args, **kwargs)
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(retention, "_removal_blocker", return_value="SKIPPED"), \
+                patch.object(sqlite3, "connect", side_effect=replace_before_vacuum):
+            self.assert_retention_refused(self.automatic_retention())
+        self.assertEqual(vacuum_statements, [])
+
+    def compose_retention_bundle(self):
+        from docker_update_manager.compose_reconcile import RecoveryBundle
+        operation_id = "e" * 32
+        source = self.root / "synthetic-compose.yml"
+        source.write_text("services: {}\n")
+        content = source.read_bytes()
+        item = SimpleNamespace(role="compose", path=str(source), present=True,
+                               sha256=hashlib.sha256(content).hexdigest(), size=len(content), content=content)
+        inputs = SimpleNamespace(files=(item,))
+        self.state.create_operation(operation_id, kind="compose_reconcile", service_key="container/" + "f" * 64,
+                                    service="app", stack="synthetic", requested_by="operator", summary={"baseline_id": "f" * 32})
+        bundle = RecoveryBundle(self.state.root, operation_id, inputs, SimpleNamespace(inventory=inputs),
+                                {"baseline_id": "f" * 32, "evidence": "a" * 64})
+        self.state.set_operation_running(operation_id)
+        self.state.finish_operation(operation_id, "succeeded", message="Synthetic completion", result={"manual_recovery_required": False})
+        self.sql("UPDATE operation_runs SET created_at='2000-01-01 00:00:00',finished_at='2000-01-01 00:00:00'")
+        self.state.prune_operations(retention_days=1)
+        with closing(sqlite3.connect(self.state.db_path)) as source, closing(sqlite3.connect(self.replacement)) as target:
+            source.backup(target)
+        self.replacement_rows = self.database_rows(self.replacement)
+        return bundle
+
+    def test_retention_invalidated_compose_bundle_keeps_files_and_receipt(self):
+        self.retention_fixture()
+        bundle = self.compose_retention_bundle()
+        real_cleanup = retention._cleanup_compose_artifact
+
+        def invalidate_before_bundle(*args, **kwargs):
+            self.replace_retention_state()
+            return real_cleanup(*args, **kwargs)
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(retention, "_cleanup_compose_artifact", side_effect=invalidate_before_bundle):
+            self.assert_retention_refused(self.automatic_retention())
+        self.assertTrue((bundle.path / "manifest.json").exists())
+        self.assertEqual(len(self.replacement_rows["compose_recovery_receipts"]), 1)
+
+    def test_pinned_retention_releases_transactions_before_bundle_and_docker_removal(self):
+        self.retention_fixture()
+        bundle = self.compose_retention_bundle()
+        from docker_update_manager import compose_recovery_retention
+        real_remove = compose_recovery_retention.remove_bundle
+        active = []
+
+        def tracked(method):
+            @contextmanager
+            def transaction(state, *args, **kwargs):
+                with method(state, *args, **kwargs) as c:
+                    active.append(c)
+                    try: yield c
+                    finally: active.remove(c)
+            return transaction
+
+        def remove_bundle(*args):
+            self.assertEqual(active, [], "SQLite transaction spans filesystem deletion")
+            return real_remove(*args)
+
+        def remove_image(image):
+            self.assertEqual(active, [], "SQLite transaction spans Docker removal")
+
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(State, "connect", tracked(State.connect)), \
+                patch.object(State, "read", tracked(State.read)), \
+                patch.object(State, "read_existing", tracked(State.read_existing)), \
+                patch.object(compose_recovery_retention, "remove_bundle", side_effect=remove_bundle):
+            code, docker, error = self.automatic_retention(on_rm=remove_image)
+        self.assertEqual(code, 0, error)
+        self.assertCountEqual(docker.removed, [PROTECTED, OTHER])
+        self.assertFalse(bundle.path.exists())
+        self.assertEqual(self.database_rows(self.state.db_path)["compose_recovery_receipts"], [])
+
+    def test_retention_replacement_during_image_removal_prevents_outcome_writes(self):
+        self.retention_fixture()
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()):
+            code, docker, error = self.automatic_retention(on_rm=lambda image: self.replace_retention_state())
+        self.assertEqual(code, cli.EXIT_FATAL)
+        self.assertIn("replaced", error)
+        self.assertEqual(len(docker.removed), 1)
+        self.assertEqual(self.database_rows(self.state.db_path), self.replacement_rows)
+
+    def test_standalone_retention_preserves_age_expiry_and_forced_operations(self):
+        self.record(PROTECTED)
+        self.record(OTHER, service="worker")
+        self.sql("UPDATE rollback_refs SET created='2000-01-01 00:00:00' WHERE image_id=?", (PROTECTED,))
+        cfg = SimpleNamespace(log_dir=self.root / "logs", data={"retention": {"recovery_days": 7}})
+        with patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(retention, "run", return_value="") as docker:
+            result = retention.cleanup(cfg, self.state)
+            self.assertEqual(result["images_removed"], 1)
+            self.assertEqual([call.args[0][-1] for call in docker.call_args_list], [PROTECTED])
+            self.assertEqual(retention.rollback_points(cfg, self.state)[0]["status"], "AVAILABLE")
+            result = retention.cleanup(cfg, self.state, all_protected=True)
+            self.assertEqual(result["images_removed"], 1)
+            self.assertEqual(docker.call_args_list[-1].args[0], ["docker", "image", "rm", OTHER])
+
+    def legacy_database(self, name):
+        root = self.root / name
+        root.mkdir()
+        path = root / "history.sqlite3"
+        with closing(sqlite3.connect(path)) as c, c:
+            c.executescript(LEGACY_SCHEMA)
+            c.execute("INSERT INTO protected_images(image_id,reason) VALUES(?,?)", (PROTECTED, "manual"))
+        return root, path
+
+    def test_existing_only_unversioned_legacy_refusal_is_unchanged_on_retries(self):
+        root, path = self.legacy_database("legacy-refusal")
+        before = path.read_bytes()
+        state = State(root, require_existing=True)
+        for candidate in (state, state, State(root, require_existing=True)):
+            with self.assertRaisesRegex(RuntimeError, "not initialised"):
+                candidate.ensure_compatible()
+            self.assertFalse(candidate.created_schema)
+            self.assertEqual(path.read_bytes(), before)
+            with closing(sqlite3.connect(path)) as c:
+                self.assertIsNone(c.execute("SELECT 1 FROM sqlite_master WHERE name='schema_version'").fetchone())
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ["history.sqlite3"])
+
+    def test_ordinary_unversioned_legacy_migration_preserves_protection(self):
+        root, path = self.legacy_database("legacy-migration")
+        state = State(root)
+        state.ensure_compatible()
+        with state.read() as c:
+            self.assertEqual(c.execute("SELECT version FROM schema_version").fetchone()[0], CORE_SCHEMA_VERSION)
+            self.assertEqual(tuple(c.execute("SELECT image_id,reason FROM protected_images").fetchone()), (PROTECTED, "manual"))
+        State(root, require_existing=True).ensure_compatible()
 
     def test_main_does_not_reach_retention_with_expired_abbreviated_ref(self):
         self.record(PROTECTED)  # active canonical ref
