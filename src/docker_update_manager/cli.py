@@ -561,9 +561,12 @@ def main(argv=None):
             state.ensure_compatible()
             with Lock(state.root/"update.lock"):
                 significant=args.command in {"update","pull","cleanup","rollback","remove"}
-                if significant: quick_snapshot(state,kind=f"before-{args.command}",reporter=NULL_REPORTER)
+                # Cleanup snapshots write only through the pinned state; collection
+                # stays outside the transaction.
+                snapshot_connect=args.cleanup_state.connect if args.command=="cleanup" else None
+                if significant: quick_snapshot(state,kind=f"before-{args.command}",reporter=NULL_REPORTER,connect=snapshot_connect)
                 result=execute(args,p,cfg,state,reporter)
-                if significant: quick_snapshot(state,kind=f"after-{args.command}",reporter=NULL_REPORTER)
+                if significant: quick_snapshot(state,kind=f"after-{args.command}",reporter=NULL_REPORTER,connect=snapshot_connect)
                 # Retention checks the pinned state at every mutation boundary,
                 # using its actual transaction for database writes.
                 cleanup_state=None

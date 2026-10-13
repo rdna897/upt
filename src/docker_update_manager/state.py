@@ -692,8 +692,10 @@ class State:
         with self.read() as c:
             return {x[0] for x in c.execute("SELECT image_id FROM protected_images")}
 
-    def save_disk_snapshot(self, kind, metrics):
-        with self.connect() as c:
+    def save_disk_snapshot(self, kind, metrics, *, connect=None):
+        # Cleanup passes its pinned CleanupState.connect so the write is
+        # verified inside the actual transaction and again before commit.
+        with (connect or self.connect)() as c:
             return c.execute("INSERT INTO disk_snapshots(kind,metrics) VALUES(?,?)", (kind, json.dumps(metrics, separators=(",", ":")))).lastrowid
 
     def compact_if_needed(self, minimum_free_bytes=1024 * 1024, minimum_free_ratio=0.20, *, verify_connection=None):

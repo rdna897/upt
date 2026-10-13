@@ -134,7 +134,7 @@ def deleted_open():
     flush(); rows=[r for r in rows if r["size"]>0]
     return {"available":True,"rows":sorted(rows,key=lambda x:x["size"],reverse=True),"total":sum(r["size"] for r in rows)}
 
-def quick_snapshot(state,kind="quick",deep=False,reporter=NULL_REPORTER,save=True):
+def quick_snapshot(state,kind="quick",deep=False,reporter=NULL_REPORTER,save=True,connect=None):
     reporter.start("disk-snapshot",f"Collecting {'deep' if deep else 'quick'} disk snapshot")
     metrics={"timestamp":datetime.now(timezone.utc).isoformat(),"filesystem":fs_metrics(),"docker":docker_df()}
     reporter.stage(1,5,"Filesystem and inode usage")
@@ -149,7 +149,7 @@ def quick_snapshot(state,kind="quick",deep=False,reporter=NULL_REPORTER,save=Tru
         croot=containerd_root()
         for key,rel in CONTAINERD_AREAS.items(): paths[str(croot/rel)]=du(croot/rel)
     metrics["paths"]=paths; reporter.stage(4,5,"Major directory metadata" if not deep else "Deep root-filesystem directory sizes")
-    if save: metrics["snapshot_id"]=state.save_disk_snapshot("deep" if deep else kind,metrics)
+    if save: metrics["snapshot_id"]=state.save_disk_snapshot("deep" if deep else kind,metrics,connect=connect)
     reporter.stage(5,5,"Save lightweight metadata" if save else "Snapshot not persisted")
     reporter.finish("Disk snapshot complete"); return metrics
 

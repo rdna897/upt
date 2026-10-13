@@ -12,6 +12,10 @@ final pruning and compaction. Database checks must use the write transaction
 being authorised, with another check before commit. Never retain a SQLite
 transaction across Docker or filesystem operations. Keep `update.lock` unchanged.
 
+The before/after disk snapshots written by `upt cleanup` use the same pinned
+transaction gate; collection stays outside the transaction and other commands
+keep ordinary snapshot persistence.
+
 Existing-only State must refuse unversioned legacy databases repeatedly without
 initialising schema metadata. Ordinary legacy migrations remain supported.
 
@@ -46,6 +50,12 @@ PR #15 change or merge. PR #19 remains open for explicit author approval.
   pass. Cleanup and CI-selection suites pass together (118 tests).
 - The full guarded Python 3.13 regression suite passes: 1,360 tests, three
   conditional skips. `git diff --check` passes.
+- Snapshot correction: six snapshot defect regressions fail against
+  `1df1398788192192deb2dc47ee442168ad974c7a` and pass with the correction; the
+  successful-cleanup and other-command snapshot tests pass on both. All 64
+  cleanup protection tests and 335 focused cleanup, retention, SQLite,
+  rollback, core and CI-selection tests pass. The full guarded suite passes:
+  1,368 tests, three conditional skips.
 - The synthetic Compose bundle fixture adds a direct dependency on the recovery
   implementation. Its CI test-group entry is extended so changes to that
   dependency also select cleanup protection; workflow gates remain unchanged.

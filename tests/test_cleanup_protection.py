@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 from sqlite_faults import select_from, sqlite_fault
 
-from docker_update_manager import cli, retention
+from docker_update_manager import cli, diskdiag, retention
 from docker_update_manager.retention import CleanupState, canonical_image_id, cleanup_blocker
 from docker_update_manager.state import State, CORE_SCHEMA_VERSION, LEGACY_SCHEMA
 from docker_update_manager.system import CommandError
@@ -947,6 +947,177 @@ class CleanupProtectionTests(unittest.TestCase):
             self.assertIsNone(canonical_image_id(value))
         self.assertEqual(cleanup_blocker(frozenset(), PROTECTED[:19]), "INVALID IMAGE IDENTITY")
         self.assertIsNone(cleanup_blocker(frozenset({PROTECTED}), FREE))
+
+    def snapshot_fixture(self):
+        """A protected image plus a byte-identical replacement database."""
+        self.record(PROTECTED)
+        self.state.save_disk_snapshot("synthetic", {})
+        self.replacement = self.root / "replacement.sqlite3"
+        with closing(sqlite3.connect(self.state.db_path)) as source, closing(sqlite3.connect(self.replacement)) as target:
+            source.backup(target)
+        self.replacement_rows = self.database_rows(self.replacement)
+        self.original_rows = dict(self.replacement_rows)
+        self.displaced = self.root / "displaced.sqlite3"
+
+    def snapshot_command(self, argv, *, on_collect=None, connect=None):
+        """Run ``argv`` through main with the real snapshot path and mocked collectors.
+
+        ``on_collect(n)`` runs during the nth snapshot collection; ``connect``
+        replaces State.connect. Returns (code, docker, stderr, retention mock).
+        """
+        collections = []
+
+        def journal():
+            collections.append(None)
+            if on_collect:
+                on_collect(len(collections))
+            return {"size": 0}
+
+        docker = _Docker([FREE])
+        cfg = SimpleNamespace(state_dir=self.state.root, log_dir=self.root / "logs", data={"retention": {"recovery_days": 7}})
+        err = io.StringIO()
+        with patch.object(cli, "Config", return_value=cfg), patch.object(cli, "run", docker), \
+                patch.object(retention, "run", docker), \
+                patch.object(retention, "_docker_image_accounting", return_value={}), \
+                patch.object(retention, "_container_image_ids", return_value=set()), \
+                patch.object(cli, "retention_cleanup", wraps=cli.retention_cleanup) as retention_pass, \
+                patch.object(diskdiag, "fs_metrics", return_value={"used": 1}), \
+                patch.object(diskdiag, "docker_df", return_value={}), \
+                patch.object(diskdiag, "container_logs", return_value=[]), \
+                patch.object(diskdiag, "container_sizes", return_value=[]), \
+                patch.object(diskdiag, "journal_usage", side_effect=journal), \
+                patch.object(State, "connect", connect or State.connect), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = cli.main(argv)
+        return code, docker, err.getvalue(), retention_pass, len(collections)
+
+    def snapshot_kinds(self, path):
+        with closing(sqlite3.connect(path)) as c:
+            return [row[0] for row in c.execute("SELECT kind FROM disk_snapshots ORDER BY id")]
+
+    def assert_snapshot_refused(self, result, message, *, removed):
+        code, docker, error, retention_pass, _ = result
+        self.assertEqual(code, cli.EXIT_FATAL, error)
+        self.assertIn(message, error)
+        self.assertEqual(docker.removed, removed)
+        retention_pass.assert_not_called()
+
+    def replace_snapshot_state(self):
+        os.replace(self.state.db_path, self.displaced)
+        for suffix in ("-wal", "-shm"):
+            Path(str(self.state.db_path) + suffix).unlink(missing_ok=True)
+        os.replace(self.replacement, self.state.db_path)
+
+    def test_cleanup_snapshot_refuses_replacement_during_pre_cleanup_collection(self):
+        self.snapshot_fixture()
+        result = self.snapshot_command(["cleanup", "--yes", "--no-progress"],
+                                       on_collect=lambda n: n == 1 and self.replace_snapshot_state())
+        self.assert_snapshot_refused(result, "replaced", removed=[])
+        self.assertEqual(result[4], 1)
+        self.assertEqual(self.database_rows(self.state.db_path), self.replacement_rows)
+        self.assertEqual(self.database_rows(self.displaced), self.original_rows)
+
+    def test_cleanup_snapshot_refuses_replacement_during_post_cleanup_collection(self):
+        self.snapshot_fixture()
+        result = self.snapshot_command(["cleanup", "--yes", "--no-progress"],
+                                       on_collect=lambda n: n == 2 and self.replace_snapshot_state())
+        self.assert_snapshot_refused(result, "replaced", removed=[FREE])
+        self.assertEqual(self.database_rows(self.state.db_path), self.replacement_rows)
+        self.assertEqual(self.snapshot_kinds(self.displaced), ["synthetic", "before-cleanup"])
+
+    def snapshot_transaction_replacement(self, collection):
+        # The pinned read before the transaction succeeds; the file is then
+        # replaced before BEGIN IMMEDIATE opens on the path.
+        self.snapshot_fixture()
+        real_connect = State.connect
+        collected = []
+
+        @contextmanager
+        def replace_before_transaction(state):
+            if collected == [collection]:
+                collected.append("replaced")
+                self.replace_snapshot_state()
+            with real_connect(state) as c:
+                yield c
+
+        result = self.snapshot_command(["cleanup", "--yes", "--no-progress"], connect=replace_before_transaction,
+                                       on_collect=lambda n: collected.append(n) if n == collection else None)
+        self.assertEqual(collected, [collection, "replaced"])
+        self.assert_snapshot_refused(result, "replaced", removed=[] if collection == 1 else [FREE])
+        self.assertEqual(self.database_rows(self.state.db_path), self.replacement_rows)
+
+    def test_cleanup_pre_snapshot_checks_transaction_opened_after_verification(self):
+        self.snapshot_transaction_replacement(1)
+
+    def test_cleanup_post_snapshot_checks_transaction_opened_after_verification(self):
+        self.snapshot_transaction_replacement(2)
+
+    def snapshot_transaction_invalidation(self, invalidate):
+        """Invalidate state after the snapshot INSERT, before commit."""
+        real_connect = State.connect
+
+        class SnapshotConnection:
+            def __init__(self, c): self.c = c
+            def __getattr__(self, name): return getattr(self.c, name)
+            def execute(self, sql, params=()):
+                result = self.c.execute(sql, params)
+                if sql.startswith("INSERT INTO disk_snapshots"):
+                    invalidate(self.c)
+                return result
+
+        @contextmanager
+        def snapshot_connection(state):
+            with real_connect(state) as c:
+                yield SnapshotConnection(c)
+
+        return self.snapshot_command(["cleanup", "--yes", "--no-progress"], connect=snapshot_connection)
+
+    def test_cleanup_snapshot_replacement_before_commit_rolls_back(self):
+        self.snapshot_fixture()
+        real_save, refusals = State.save_disk_snapshot, []
+
+        def save(state, *args, **kwargs):
+            try:
+                return real_save(state, *args, **kwargs)
+            except RuntimeError as exc:
+                refusals.append(str(exc))
+                raise
+
+        with patch.object(State, "save_disk_snapshot", save):
+            result = self.snapshot_transaction_invalidation(lambda c: self.replace_snapshot_state())
+        self.assert_snapshot_refused(result, "replaced", removed=[])
+        # The snapshot write itself refused, rather than a later cleanup check.
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("replaced", refusals[0])
+        self.assertEqual(self.database_rows(self.state.db_path), self.replacement_rows)
+        # The open transaction on the displaced file was rolled back.
+        self.assertEqual(self.database_rows(self.displaced), self.original_rows)
+
+    def test_cleanup_snapshot_protection_invalidated_in_transaction_rolls_back(self):
+        self.snapshot_fixture()
+        result = self.snapshot_transaction_invalidation(
+            lambda c: c.execute("INSERT INTO protected_images(image_id,reason) VALUES('short-id','synthetic invalidation')"))
+        self.assert_snapshot_refused(result, "non-canonical", removed=[])
+        self.assertEqual(self.database_rows(self.state.db_path), self.original_rows)
+
+    def test_successful_cleanup_persists_before_and_after_snapshots(self):
+        self.snapshot_fixture()
+        code, docker, error, retention_pass, collections = self.snapshot_command(["cleanup", "--yes", "--no-progress"])
+        self.assertEqual(code, 0, error)
+        self.assertEqual(docker.removed, [FREE])
+        retention_pass.assert_called_once()
+        self.assertEqual(collections, 2)
+        self.assertEqual(self.snapshot_kinds(self.state.db_path), ["synthetic", "before-cleanup", "after-cleanup"])
+        snapshots = {row["kind"]: row["metrics"] for row in self.state.disk_snapshots()}
+        self.assertEqual(snapshots["after-cleanup"]["filesystem"], {"used": 1})
+
+    def test_other_modifying_commands_keep_ordinary_snapshot_persistence(self):
+        self.snapshot_fixture()
+        with patch.object(cli, "execute", return_value=0), patch.object(cli, "CleanupState", side_effect=AssertionError):
+            code, docker, error, retention_pass, collections = self.snapshot_command(["update", "app", "--yes", "--no-progress"])
+        self.assertEqual(code, 0, error)
+        self.assertEqual(collections, 2)
+        self.assertEqual(self.snapshot_kinds(self.state.db_path), ["synthetic", "before-update", "after-update"])
 
 
 if __name__ == "__main__":
