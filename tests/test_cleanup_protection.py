@@ -9,14 +9,14 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from sqlite_faults import select_from, sqlite_fault
 
-from docker_update_manager import cli
+from docker_update_manager import cli, retention
 from docker_update_manager.retention import CleanupState, canonical_image_id, cleanup_blocker
 from docker_update_manager.state import State
 from docker_update_manager.system import CommandError
@@ -383,12 +383,12 @@ class CleanupProtectionTests(unittest.TestCase):
         docker = _Docker([FREE], on_rm=replace_state)
         with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
                 patch.object(cli, "quick_snapshot", lambda *a, **k: None), \
-                patch.object(cli, "retention_cleanup") as retention, \
+                patch.object(cli, "retention_cleanup") as retention_pass, \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             code = cli.main(["cleanup", "--yes"])
         self.assertEqual(code, cli.EXIT_FATAL)
         self.assertEqual(docker.removed, [FREE])
-        retention.assert_not_called()
+        retention_pass.assert_not_called()
 
     def test_retention_pass_revalidates_pinned_state_before_each_removal(self):
         self.record(PROTECTED, service="app")
@@ -420,6 +420,56 @@ class CleanupProtectionTests(unittest.TestCase):
         self.assertEqual(code, cli.EXIT_FATAL)
         self.assertEqual(removed, [PROTECTED])  # OTHER's removal was refused
         self.assertNotIn(OTHER, removed)
+
+    def test_retention_pass_skips_image_protected_just_before_removal(self):
+        self.record(PROTECTED, service="app")
+        self.record(OTHER, service="worker")
+        self.sql("UPDATE rollback_refs SET created='2000-01-01 00:00:00'")
+        removed = []
+        real_blocker = retention._removal_blocker
+
+        def concurrent_writer(state, image_id, **kwargs):
+            reason = real_blocker(state, image_id, **kwargs)
+            if image_id == OTHER:  # a new update publishes an active ref now
+                self.record(OTHER, service="third")
+            return reason
+
+        def docker(args, **kwargs):
+            if args[:3] == ["docker", "image", "ls"]:
+                return "\n"
+            if args[:3] == ["docker", "image", "rm"]:
+                removed.append(args[-1])
+                return ""
+            if args[:3] == ["docker", "ps", "-aq"]:
+                return ""
+            raise CommandError("not mocked")
+        with patch.dict(os.environ, {"UPT_STATE_DIR": str(self.state.root)}), patch.object(cli, "run", docker), \
+                patch("docker_update_manager.retention.run", docker), \
+                patch.object(retention, "_removal_blocker", concurrent_writer), \
+                patch.object(cli, "quick_snapshot", lambda *a, **k: None), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = cli.main(["cleanup", "--yes"])
+        self.assertEqual(code, 0)
+        self.assertEqual(removed, [PROTECTED])
+
+    def test_existing_only_compaction_never_recreates_a_removed_database(self):
+        state = State(self.state.root, require_existing=True)
+        with self.state.connect() as c:
+            c.execute("CREATE TABLE filler(x)")
+            c.executemany("INSERT INTO filler VALUES(?)", [("x" * 4000,)] * 600)
+        with self.state.connect() as c:
+            c.execute("DROP TABLE filler")
+        real_read = State.read
+
+        @contextmanager
+        def read_then_vanish(self_, *args, **kwargs):
+            with real_read(self_, *args, **kwargs) as c:
+                yield c
+            for suffix in ("", "-wal", "-shm"):
+                Path(str(self_.db_path) + suffix).unlink(missing_ok=True)
+        with patch.object(State, "read", read_then_vanish), self.assertRaises(sqlite3.OperationalError):
+            state.compact_if_needed()
+        self.assertFalse(state.db_path.exists())
 
     def test_state_errors_during_cleanup_are_fatal_not_tracebacks(self):
         real = State.ensure_compatible

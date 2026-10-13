@@ -710,7 +710,9 @@ class State:
             return {"compacted": False, "bytes_reclaimed": 0, "free_bytes": free_bytes}
         # VACUUM cannot run inside the write transaction opened by connect().
         # Use a short-lived autocommit connection after the free-page check.
-        vacuum = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        # An existing-only State must not recreate a database removed meanwhile.
+        target = f"{self.db_path.resolve().as_uri()}?mode=rw" if self._require_existing else self.db_path
+        vacuum = sqlite3.connect(target, timeout=30, isolation_level=None, uri=self._require_existing)
         try:
             vacuum.execute("PRAGMA busy_timeout=30000")
             vacuum.execute("VACUUM")

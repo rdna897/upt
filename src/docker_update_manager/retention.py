@@ -380,9 +380,11 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
                                              "service":image_points[0].get("service"),"reclaimable":max((p.get("potential_reclaimable",0) for p in image_points),default=0),
                                              "action":planned})
             reporter.advance(index,task_total,image_id[:19],action); continue
-        # Optional caller check (``upt cleanup``'s pinned state); raising
-        # stops the run before this removal and is deliberately not caught.
-        if revalidate: revalidate()
+        # Optional caller check (``upt cleanup``'s pinned state): a returned
+        # reason skips this image; raising stops the run and is not caught.
+        reason=revalidate(image_id) if revalidate else None
+        if reason:
+            reason="SKIPPED - "+reason; result["skipped"].append({"image":image_id,"reason":reason}); reporter.warning(reason,image_id[:19]); continue
         terminal=None
         try:
             run(["docker","image","rm",image_id],timeout=300)

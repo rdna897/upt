@@ -566,8 +566,10 @@ def main(argv=None):
                 if significant: quick_snapshot(state,kind=f"after-{args.command}",reporter=NULL_REPORTER)
                 # The retention pass below must act on the same verified state,
                 # rechecked before each of its removals too.
-                revalidate=args.cleanup_state.protection if args.command=="cleanup" else None
-                if revalidate: revalidate()
+                revalidate=None
+                if args.command=="cleanup":
+                    args.cleanup_state.protection()
+                    revalidate=lambda image: cleanup_blocker(args.cleanup_state.protection(),image)
                 retained=retention_cleanup(cfg,state,reporter=NULL_REPORTER,automatic=True,revalidate=revalidate)
                 if retained.get("files_removed") or retained.get("images_removed") or retained.get("images_absent"):
                     print(f"\nRetention cleanup: {retained['files_removed']} artefact(s), {retained['images_removed']} image(s), {retained.get('images_absent',0)} absent image(s) reconciled, {human_size(retained['reclaimed'])} reclaimed.")
