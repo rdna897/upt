@@ -384,7 +384,8 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
         # reason skips this image; raising stops the run and is not caught.
         reason=revalidate(image_id) if revalidate else None
         if reason:
-            reason="SKIPPED - "+reason; result["skipped"].append({"image":image_id,"reason":reason}); reporter.warning(reason,image_id[:19]); continue
+            reason="SKIPPED - "+reason; result["skipped"].append({"image":image_id,"reason":reason}); reporter.warning(reason,image_id[:19])
+            reporter.advance(index,task_total,image_id[:19],"skipped"); continue
         terminal=None
         try:
             run(["docker","image","rm",image_id],timeout=300)

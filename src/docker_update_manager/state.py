@@ -699,6 +699,8 @@ class State:
 
     def compact_if_needed(self, minimum_free_bytes=1024 * 1024, minimum_free_ratio=0.20):
         if not self.db_path.exists():
+            if self._require_existing:
+                raise RuntimeError("UPT state database disappeared; refusing to continue")
             return {"compacted": False, "bytes_reclaimed": 0}
         before = self.db_path.stat().st_size
         with self.read() as c:

@@ -471,6 +471,14 @@ class CleanupProtectionTests(unittest.TestCase):
             state.compact_if_needed()
         self.assertFalse(state.db_path.exists())
 
+    def test_database_vanishing_before_compaction_is_fatal(self):
+        state = State(self.state.root, require_existing=True)
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(state.db_path) + suffix).unlink(missing_ok=True)
+        with self.assertRaisesRegex(RuntimeError, "disappeared"):
+            state.compact_if_needed()
+        self.assertEqual(State(self.root / "other").compact_if_needed(), {"compacted": False, "bytes_reclaimed": 0})
+
     def test_state_errors_during_cleanup_are_fatal_not_tracebacks(self):
         real = State.ensure_compatible
 
