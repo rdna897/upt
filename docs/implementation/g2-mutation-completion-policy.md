@@ -145,7 +145,7 @@ Three cases are distinct:
 
 The web rollback `NO CHANGES MADE` fallback (`webservice.py:2147-2165`) may run only when the adapter can prove the boundary was not crossed: a new-protocol operation has no committed guard, and the in-memory boundary flag is false.
 
-**Status vocabulary (D9).** The new terminal status `unresolved` is the approved policy direction (an API/UI contract change, without a schema change). Existing code cannot express this safely until API, SSE, polling, frontend and older-client compatibility are implemented and tested. No G2 path may publish an unverified outcome as `succeeded` or `failed`; S1, S3 and S4 remain blocked on that *implementation gate*, not an outstanding policy decision.
+**Status vocabulary (D9).** The new terminal status `unresolved` is the approved policy direction (an API/UI contract change, without a schema change). Existing code cannot express this safely until API, SSE, polling, frontend and older-client compatibility are implemented and tested. An observed successful workload with unverified History must not be labelled `succeeded` or `failed`: it is `unresolved`. A genuinely failed workload or proven pre-mutation block may retain `failed`/`blocked` with explicit publication-warning fields under P8; uncertain outcomes retain P8's separate conservative mapping. S1, S3 and S4 remain blocked on the *implementation gate*, not an outstanding policy decision.
 
 ### P9 — Rollback eligibility versus protection
 
