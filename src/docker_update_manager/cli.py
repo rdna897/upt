@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, difflib, json, os, platform, shutil, signal, sys
+import argparse, difflib, json, os, platform, shutil, signal, sqlite3, sys
 from functools import partial
 from pathlib import Path
 import yaml
@@ -19,7 +19,7 @@ from .progress import Reporter, NULL_REPORTER
 from .conversion import generate_conversion, deploy_conversion, rollback_conversion, default_stack_path
 from . import diskcli
 from .diskdiag import fs_metrics, docker_df, container_logs, deleted_open, quick_snapshot
-from .retention import inventory as retention_inventory, cleanup as retention_cleanup, rollback_points
+from .retention import inventory as retention_inventory, cleanup as retention_cleanup, rollback_points, canonical_image_id, CleanupState, cleanup_blocker
 from .removal import remove_service
 from .reconciliation import queue_agent_project_refresh, queue_agent_verification
 
@@ -83,7 +83,7 @@ def parser():
     add("health",COMMANDS["health"]); add("mutable",COMMANDS["mutable"]); add("pinned",COMMANDS["pinned"])
     q=add("compose",COMMANDS["compose"]); q.add_argument("service")
     q=add("images",COMMANDS["images"]); progress_options(q)
-    q=add("cleanup",COMMANDS["cleanup"],"Only dangling/unreferenced images are candidates; rollback images are protected."); modifying(q); progress_options(q)
+    q=add("cleanup",COMMANDS["cleanup"],"Only dangling/unreferenced images are candidates; rollback images are protected. Images are matched by full ID and protection is rechecked before each removal. Automatic retention revalidates the same versioned state database before each recovery deletion and database mutation, including compaction. Verification failure stops cleanup. Nothing is removed if the UPT state database is missing, unversioned or unreadable, or Docker returns an unrecognised image ID."); modifying(q); progress_options(q)
     q=add("remove",COMMANDS["remove"],"Removes one Compose service container or standalone container. Data and configuration are preserved by default. --images also removes eligible images. --purge-data permanently deletes only named volumes, root-filesystem bind paths, and Compose/config sources that UPT can establish are not shared; ambiguous or shared resources are skipped.\n\nExamples:\n  upt remove flaresolverr --dry-run\n  upt remove flaresolverr --images --dry-run\n  upt remove flaresolverr --purge-data --dry-run\n  upt remove flaresolverr --images --purge-data\n\n--purge-data creates no recovery copy and requires typing DELETE SERVICE unless --yes is supplied. Always run the dry-run first."); q.add_argument("service"); q.add_argument("--images",action="store_true",help="also remove unused current and rollback images belonging to SERVICE"); q.add_argument("--purge-data","--data",dest="purge_data",action="store_true",help="permanently delete eligible unshared named volumes, bind data, and Compose/config sources"); modifying(q); progress_options(q)
     q=add("convert",COMMANDS["convert"],"Converted stacks are created under /root/SERVICE-stack by default (configurable with conversion_root). Default conversion pins the exact running digest. --track-tag preserves the original mutable tag for future scans while adoption still uses the running image. --deploy stops and renames the original container but does not delete it.\n\nExamples:\n  upt convert portainer --dry-run\n  upt convert portainer --track-tag --dry-run\n  upt convert portainer --track-tag --deploy\n  upt convert portainer --rollback"); q.add_argument("service"); modifying(q); progress_options(q); q.add_argument("--output",type=Path,help="override the default /root/SERVICE-stack directory"); q.add_argument("--deploy",action="store_true"); q.add_argument("--rollback",action="store_true"); q.add_argument("--replace-files",action="store_true"); q.add_argument("--track-tag",action="store_true",help="preserve the configured tag so future updates can be detected")
     q=add("disk",COMMANDS["disk"],"Actions: diagnose, growth, diff, history, largest, files, docker, containerd, containers, logs, journal, volumes, deleted, inodes, snapshot, watch"); diskcli.configure(q); progress_options(q)
@@ -416,17 +416,45 @@ def image_report(state):
     table([(x.get("Repository"),x.get("Tag"),short(x.get("ID")),"ROLLBACK PROTECTED" if x.get("ID") in protected else "local") for x in data],["REPOSITORY","TAG","IMAGE ID","RELATION"])
 
 def cleanup(state,args,reporter=NULL_REPORTER):
+    pinned=getattr(args,"cleanup_state",None)
+    if pinned is None:
+        with CleanupState(state) as pinned: return _cleanup(pinned,args,reporter)
+    return _cleanup(pinned,args,reporter)
+
+def _cleanup(pinned,args,reporter):
     reporter.start("cleanup","Analysing Docker storage")
-    protected=state.protected(); ids=run(["docker","image","ls","-q","--filter","dangling=true"]).split(); candidates=[x for x in dict.fromkeys(ids) if x not in protected]
-    print(f"Dangling image candidates: {len(candidates)}\nProtected rollback images: {len(protected)}")
+    # Full IDs only: abbreviated IDs never match stored protection (issue #17).
+    listed=run(["docker","image","ls","-q","--no-trunc","--filter","dangling=true"]).split()
+    invalid=[x for x in dict.fromkeys(listed) if canonical_image_id(x) is None]
+    dangling=list(dict.fromkeys(x for x in map(canonical_image_id,listed) if x))
+    protection=pinned.protection()
+    protected=[(x,r) for x in dangling if (r:=cleanup_blocker(protection,x))]
+    candidates=[x for x in dangling if not cleanup_blocker(protection,x)]
+    print(f"Dangling image candidates: {len(candidates)}\nProtected rollback images: {len(protected)}\nInvalid image identities: {len(invalid)}")
     for x in candidates: print("  "+x)
+    if protected: print("Protected (not removed; rollback images still expire through normal retention, see `upt retention`):")
+    for x,reason in protected: print(f"  {x}  {reason}")
+    if invalid: print("Invalid (not removed):")
+    for x in invalid: print("  "+x)
+    if invalid:
+        # Output Docker did not identify exactly cannot prove any listing safe.
+        raise RuntimeError(f"Docker returned {len(invalid)} unrecognised image identity(ies); refusing to remove any image")
     if args.dry_run: reporter.finish("Cleanup analysis complete"); print("DRY RUN — no images removed."); return
     if not candidates: reporter.finish("Cleanup complete: nothing eligible"); return
     if not args.yes and input("Remove these unprotected dangling images? [y/N] ").lower() not in {"y","yes"}: return
-    for i,image in enumerate(candidates,1):
-        with reporter.task("Removing image",service=short(image)): run(["docker","image","rm",image])
-        reporter.advance(i,len(candidates),short(image),"removed")
-    reporter.finish(f"Cleanup complete: removed {len(candidates)} images"); print(f"Removed {len(candidates)} images.")
+    removed=0; skipped=[]
+    try:
+        for i,image in enumerate(candidates,1):
+            # Fresh short read before each removal; no SQLite transaction spans Docker.
+            reason=cleanup_blocker(pinned.protection(),image)
+            if reason:
+                skipped.append(image); reporter.warning("SKIPPED - "+reason,short(image)); print(f"  skipped {image}: {reason}")
+                reporter.advance(i,len(candidates),short(image),"skipped"); continue
+            with reporter.task("Removing image",service=short(image)): run(["docker","image","rm",image])
+            removed+=1; reporter.advance(i,len(candidates),short(image),"removed")
+    finally:
+        print(f"Removed {removed} images."+(f" Skipped {len(skipped)} newly protected image(s)." if skipped else ""))
+    reporter.finish(f"Cleanup complete: removed {removed} images")
 
 def doctor(cfg,state,reporter=NULL_REPORTER):
     reporter.start("doctor","Diagnosing Docker Update Manager",total=19)
@@ -516,20 +544,36 @@ def main(argv=None):
     try:
         args=p.parse_args(argv)
         if argv and argv[0] in {"-h","--help"}: print_main_help(p); return 0
-        cfg=Config(); state=State(cfg.state_dir)
+        # Cleanup must never create or initialise state: an empty database would
+        # report no rollback protection, on this run or a retry.
+        cfg=Config(); state=State(cfg.state_dir,require_existing=args.command=="cleanup")
         json_mode=bool(getattr(args,"json",False)); quiet=bool(getattr(args,"quiet",False))
         enabled=not bool(getattr(args,"no_progress",False)) and not quiet and not json_mode
         force=True if bool(getattr(args,"progress",False)) else None
         reporter=Reporter(enabled=enabled,force=force,stream=(sys.stderr if json_mode else sys.stdout))
+        if args.command=="cleanup":
+            # Pin existing state first: ensure_compatible would create or
+            # initialise an empty database, hiding lost protection.
+            args.cleanup_state=CleanupState(state); state.ensure_compatible()
+            args.cleanup_state.protection()  # refuse before the lock, snapshots or Docker
         if args.command in MODIFYING and not bool(getattr(args,"dry_run",False)):
             # Before the lock, snapshots, backups or any Docker/source mutation.
             state.ensure_compatible()
             with Lock(state.root/"update.lock"):
                 significant=args.command in {"update","pull","cleanup","rollback","remove"}
-                if significant: quick_snapshot(state,kind=f"before-{args.command}",reporter=NULL_REPORTER)
+                # Cleanup snapshots write only through the pinned state; collection
+                # stays outside the transaction.
+                snapshot_connect=args.cleanup_state.connect if args.command=="cleanup" else None
+                if significant: quick_snapshot(state,kind=f"before-{args.command}",reporter=NULL_REPORTER,connect=snapshot_connect)
                 result=execute(args,p,cfg,state,reporter)
-                if significant: quick_snapshot(state,kind=f"after-{args.command}",reporter=NULL_REPORTER)
-                retained=retention_cleanup(cfg,state,reporter=NULL_REPORTER,automatic=True)
+                if significant: quick_snapshot(state,kind=f"after-{args.command}",reporter=NULL_REPORTER,connect=snapshot_connect)
+                # Retention checks the pinned state at every mutation boundary,
+                # using its actual transaction for database writes.
+                cleanup_state=None
+                if args.command=="cleanup":
+                    cleanup_state=args.cleanup_state
+                    cleanup_state.protection()
+                retained=retention_cleanup(cfg,state,reporter=NULL_REPORTER,automatic=True,cleanup_state=cleanup_state)
                 if retained.get("files_removed") or retained.get("images_removed") or retained.get("images_absent"):
                     print(f"\nRetention cleanup: {retained['files_removed']} artefact(s), {retained['images_removed']} image(s), {retained.get('images_absent',0)} absent image(s) reconciled, {human_size(retained['reclaimed'])} reclaimed.")
                 if retained.get("failures"):
@@ -538,8 +582,13 @@ def main(argv=None):
         return execute(args,p,cfg,state,reporter)
     except KeyboardInterrupt: print("\nInterrupted safely; completed backups were preserved.",file=sys.stderr); return 130
     except (ValueError,RuntimeError,CommandError,yaml.YAMLError) as e: print(f"Error: {e}",file=sys.stderr); return EXIT_FATAL
+    except (sqlite3.Error,OSError) as e:
+        # Cleanup refuses on any state failure; other commands keep their behaviour.
+        if getattr(locals().get('args'),"command",None)!="cleanup": raise
+        print(f"Error: UPT state could not be verified ({type(e).__name__}); refusing to remove images",file=sys.stderr); return EXIT_FATAL
     finally:
         if 'reporter' in locals(): reporter.close()
+        if getattr(locals().get('args'),"cleanup_state",None): args.cleanup_state.close()
         signal.signal(signal.SIGTERM,old_term)
 
 if __name__=="__main__": raise SystemExit(main())

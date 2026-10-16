@@ -171,22 +171,31 @@ class State:
     supports_service_verification = True
     core_schema_identity = CORE_SCHEMA_IDENTITY
 
-    def __init__(self, root: Path, *, quiescent_transition=False):
+    def __init__(self, root: Path, *, quiescent_transition=False, require_existing=False):
         self.root = Path(root)
         self.db_path = self.root / "history.sqlite3"
         self._schema_lock = threading.Lock()
         self._schema_ready = False
         self._schema_version = None
         self._quiescent_transition = quiescent_transition
+        # Set once this instance initialises a database that had no schema.
+        self.created_schema = False
+        # Never create or initialise a database: only open and migrate one
+        # that already has a schema (fail-closed safety commands).
+        self._require_existing = require_existing
 
-    def _new_connection(self, timeout=None):
+    def _new_connection(self, timeout=None, *, existing=False):
         """Open a configured connection after ensuring its containing directory.
 
         ``timeout`` bounds both the open and SQLite's busy wait (default 30 s).
+        ``existing`` opens only an existing database file and never creates one.
         """
         timeout = sqlite_timeout(timeout)
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        connection = sqlite3.connect(self.db_path, timeout=timeout)
+        if existing or self._require_existing:
+            connection = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=rw", uri=True, timeout=timeout)
+        else:
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            connection = sqlite3.connect(self.db_path, timeout=timeout)
         connection.row_factory = sqlite3.Row
         os.chmod(self.db_path, 0o600)
         for suffix in ("-wal", "-shm"):
@@ -239,18 +248,24 @@ class State:
             self._schema_ready = False
             connection = self._new_connection(timeout=timeout)
             try:
+                if self._require_existing:
+                    self._require_schema_table(connection)
                 # WAL is configured before the migration transaction. Normal
                 # reads then use deferred read transactions and never reserve
                 # the single SQLite writer slot.
                 connection.execute("PRAGMA journal_mode=WAL")
                 connection.execute("BEGIN IMMEDIATE")
+                if self._require_existing:
+                    self._require_schema_table(connection)
                 old = connection.execute("SELECT name FROM sqlite_master WHERE name='schema_version'").fetchone()
                 version = connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone() if old else None
                 if self.core_schema_identity is not None and version and int(version[0]) == 8 and not self._quiescent_transition:
                     raise RuntimeError("schema 8 to 9 requires the offline quiescent state transition")
+                created = not version
                 self._migrate(connection)
                 version = int(connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone()[0])
                 connection.commit()
+                self.created_schema = self.created_schema or created
                 for suffix in ("-wal", "-shm"):
                     sidecar = Path(str(self.db_path) + suffix)
                     try:
@@ -264,6 +279,16 @@ class State:
                 raise
             finally:
                 connection.close()
+
+    @staticmethod
+    def _require_schema_table(connection):
+        # Existing-only state must already have version metadata. Ordinary
+        # State opening still supports unversioned legacy migrations.
+        names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        versions = [tuple(row) for row in connection.execute("SELECT version FROM schema_version")] if "schema_version" in names else None
+        if (not {"history", "protected_images", "rollback_refs", "schema_version"} <= names
+                or versions is None or len(versions) != 1 or type(versions[0][0]) is not int or versions[0][0] < 1):
+            raise RuntimeError("UPT state database is not initialised; refusing to initialise it")
 
     @contextmanager
     def connect(self):
@@ -353,6 +378,21 @@ class State:
         """
         self._ensure_schema(timeout=timeout)
         c = self._new_connection(timeout=timeout)
+        try:
+            c.execute("BEGIN")
+            yield c
+        finally:
+            c.rollback()
+            c.close()
+
+    @contextmanager
+    def read_existing(self, *, timeout=None):
+        """Read transaction that never creates, initialises or migrates state.
+
+        For fail-closed safety checks: a missing database raises instead of
+        being replaced by an empty one. Callers must verify the schema.
+        """
+        c = self._new_connection(timeout=timeout, existing=True)
         try:
             c.execute("BEGIN")
             yield c
@@ -652,15 +692,20 @@ class State:
         with self.read() as c:
             return {x[0] for x in c.execute("SELECT image_id FROM protected_images")}
 
-    def save_disk_snapshot(self, kind, metrics):
-        with self.connect() as c:
+    def save_disk_snapshot(self, kind, metrics, *, connect=None):
+        # Cleanup passes its pinned CleanupState.connect so the write is
+        # verified inside the actual transaction and again before commit.
+        with (connect or self.connect)() as c:
             return c.execute("INSERT INTO disk_snapshots(kind,metrics) VALUES(?,?)", (kind, json.dumps(metrics, separators=(",", ":")))).lastrowid
 
-    def compact_if_needed(self, minimum_free_bytes=1024 * 1024, minimum_free_ratio=0.20):
+    def compact_if_needed(self, minimum_free_bytes=1024 * 1024, minimum_free_ratio=0.20, *, verify_connection=None):
         if not self.db_path.exists():
+            if self._require_existing:
+                raise RuntimeError("UPT state database disappeared; refusing to continue")
             return {"compacted": False, "bytes_reclaimed": 0}
         before = self.db_path.stat().st_size
         with self.read() as c:
+            if verify_connection: verify_connection(c)
             page_size = c.execute("PRAGMA page_size").fetchone()[0]
             page_count = c.execute("PRAGMA page_count").fetchone()[0]
             free_pages = c.execute("PRAGMA freelist_count").fetchone()[0]
@@ -669,10 +714,16 @@ class State:
             return {"compacted": False, "bytes_reclaimed": 0, "free_bytes": free_bytes}
         # VACUUM cannot run inside the write transaction opened by connect().
         # Use a short-lived autocommit connection after the free-page check.
-        vacuum = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        # An existing-only State must not recreate a database removed meanwhile.
+        target = f"{self.db_path.resolve().as_uri()}?mode=rw" if self._require_existing else self.db_path
+        vacuum = sqlite3.connect(target, timeout=30, isolation_level=None, uri=self._require_existing)
         try:
             vacuum.execute("PRAGMA busy_timeout=30000")
+            # VACUUM owns its transaction. Verify its actual connection, not
+            # a separate read that could authorise a replaced database.
+            if verify_connection: verify_connection(vacuum)
             vacuum.execute("VACUUM")
+            if verify_connection: verify_connection(vacuum)
         finally:
             vacuum.close()
         after = self.db_path.stat().st_size
