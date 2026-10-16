@@ -91,8 +91,8 @@ A 32-hex `completion_id` is fixed before the mutation boundary: web operations u
 ### P4 — One monotonic completion deadline
 
 - One deadline per mutation, measured with `time.monotonic()` from the workload completion point (or from the failure point for failure rows). It covers **every** completion-side SQLite step: connection open, busy waits, history writes, reconciliation reads, back-off sleeps, the web terminal write and its read-back.
-- Recommended budget: **60 s** (D5). This replaces the earlier "3 × 30 s + back-off ≈ 91 s" estimate, which bounded writes only.
-- Each step receives `min(remaining, 30 s)` as its connection and busy timeout. This requires a `State`-level per-call timeout (an API addition with no schema change), because `_new_connection` currently fixes 30 s.
+- Approved budget: **60 s** (D5). This replaces the earlier "3 × 30 s + back-off ≈ 91 s" estimate, which bounded writes only.
+- Each step receives `min(remaining, 30 s)` as its connection and busy timeout. The per-call timeout and before-/during-commit classification primitives are already implemented in merged S0a PR #16; the shared publisher deadline and retry policy are not yet implemented.
 - Writes are retried only for `sqlite3.OperationalError`, and only as P5 permits. `IntegrityError`, `ValueError` (for example namespace publication authorisation), `TypeError` and programming errors stop further writes immediately; P5 reads may still classify the outcome.
 - Back-off is 0.2 s, then 0.4 s, then 0.8 s (capped at 1 s), never past the deadline.
 - **Exhaustion:** no new SQLite step starts after the deadline. A statement already executing is not interrupted (an in-progress commit cannot be safely abandoned); its outcome is classified by P5 with no further reads. The final classification stands: `not_committed`, `ambiguous` or `contradictory` all mean "record not verified". No insert ever happens after the deadline, so exhaustion cannot create a duplicate, and W is reported unchanged.
@@ -101,7 +101,7 @@ A 32-hex `completion_id` is fixed before the mutation boundary: web operations u
 
 **Invariant:** an insert for a completion key is never retried unless the key's absence has been established in the same publisher run, either by a successful read finding no row or because the failed transaction is known to have rolled back before `commit()`. G2 adds no database uniqueness, so no other condition permits a retry.
 
-`State` must let the publisher distinguish "failed before `commit()`" (rolled back, `not_committed`) from "failed in or after `commit()`" (unknown). Until it can, every write failure is treated as unknown.
+Merged S0a PR #16 provides the transaction outcome classification primitives to distinguish failures known to precede `commit()` from failures whose result is ambiguous. Until a G2 publisher consumes those primitives and proves the outcome, an otherwise unclassified write failure is treated as unknown.
 
 Before the first insert the publisher reads by key: an existing matching row is `committed` (no insert), a contradictory row is `contradictory` (no insert), and a failed read means no insert until a later read succeeds. Decision tree after each write attempt:
 
@@ -145,7 +145,7 @@ Three cases are distinct:
 
 The web rollback `NO CHANGES MADE` fallback (`webservice.py:2147-2165`) may run only when the adapter can prove the boundary was not crossed: a new-protocol operation has no committed guard, and the in-memory boundary flag is false.
 
-**Status vocabulary (D9).** The current vocabulary cannot express "unresolved" without misusing `failed`. The recommended option is a new terminal status `unresolved` (an API/UI contract change, no schema change); see D9 for the alternatives and the required compatibility review. Until D9 is decided, no G2 slice may write an unverified outcome as `succeeded` or `failed`; slices that need it (S1, S3, S4) are blocked on D9.
+**Status vocabulary (D9).** The new terminal status `unresolved` is the approved policy direction (an API/UI contract change, without a schema change). Existing code cannot express this safely until API, SSE, polling, frontend and older-client compatibility are implemented and tested. No G2 path may publish an unverified outcome as `succeeded` or `failed`; S1, S3 and S4 remain blocked on that *implementation gate*, not an outstanding policy decision.
 
 ### P9 — Rollback eligibility versus protection
 
