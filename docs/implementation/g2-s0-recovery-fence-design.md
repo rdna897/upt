@@ -11,7 +11,7 @@
 | A — typed G2 evidence in `compose_bootstrap_fences` | **Rejected for G2:** namespace-consumer updates also insert a fence for the same logical key and operation ID, causing UNIQUE/PK collisions after image pull. Old R10 cleanup does not understand new image/backup claims. Mixed G2 and legacy evidence increases failure-domain coupling. |
 | **B — `completion_fences` and `completion_fence_claims` in schema 10** | **Selected:** dedicated durable owner identity, typed indexed image/backup claims, separate namespace/bootstrap lifecycle, mechanical old-binary schema refusal. Requires separately approved offline 9→10 migration, no silent auto-migration, and a guarded release/downgrade plan. |
 | C — `operation_runs.summary` only | **Rejected:** not reliably enforced by existing gates; new CLI `operation_runs` rows collide with web-only active and abandonment semantics. |
- 
+
 **Important:** Option B fixes the shared-table collision and adds a schema-level *binary compatibility check*; it does **not** itself solve own-operation admission, identity drift, truthful publication, operator release or retention. Those remain acceptance gates below.
 
 ## 2. Storage contract and offline migration
