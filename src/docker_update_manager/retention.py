@@ -1,7 +1,8 @@
 """Retention for recovery artefacts owned exclusively by Docker Update Manager."""
 from __future__ import annotations
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-import json, os, shutil, sqlite3
+import json, os, re, shutil, sqlite3
 from pathlib import Path
 from .diskdiag import du, parse_size
 from .progress import NULL_REPORTER
@@ -29,6 +30,113 @@ _UNRESOLVED_PROTECTION=(
     "SELECT 1 FROM protected_images p WHERE p.image_id=? "
     "AND NOT "+_matching_ref()+" AND NOT ("+_LEGACY_CANDIDATE+")"
 )
+# Dangling-image cleanup applies the same rules without migrating refs: every
+# active ref, and every protection its own ref has not resolved. The latter
+# includes NULL-history/manual/namespace rows and unmigrated legacy rows, which
+# retention would first turn into active refs.
+_CLEANUP_PROTECTED=(
+    "SELECT image_id FROM rollback_refs WHERE expired=0 "
+    "UNION SELECT p.image_id FROM protected_images p WHERE NOT "+_matching_ref()
+)
+_IMAGE_ID=re.compile(r"sha256:[0-9a-f]{64}")
+
+def canonical_image_id(value):
+    """Return ``sha256:<64 lowercase hex>``, or None for anything less exact."""
+    if not isinstance(value,str): return None
+    text=value.strip().lower()
+    return text if _IMAGE_ID.fullmatch(text) else None
+
+_REFUSED="refusing to remove images"
+
+class CleanupState:
+    """The verified state database for one dangling-image cleanup run.
+
+    Opening requires an existing, initialised database without creating or
+    initialising one, and holds a descriptor so the inode cannot be reused.
+    Every ``protection()`` read then refuses unless the same file is still in
+    place with the current schema, so a missing, emptied, replaced,
+    unreadable or incompatible database never yields an empty protection set.
+    """
+
+    def __init__(self,state):
+        self.state=state
+        try: self._fd=os.open(state.db_path,os.O_RDONLY|os.O_CLOEXEC)
+        except FileNotFoundError:
+            raise RuntimeError(f"UPT state database is missing; rollback protection cannot be verified, so {_REFUSED}") from None
+        except OSError as exc:
+            raise RuntimeError(f"UPT state database cannot be opened ({exc.strerror or type(exc).__name__}); {_REFUSED}") from None
+        try:
+            pinned=os.fstat(self._fd); self._identity=(pinned.st_dev,pinned.st_ino)
+            with self._read() as c: self._require_schema(c,current=False)
+        except BaseException:
+            os.close(self._fd); raise
+
+    def __enter__(self): return self
+    def __exit__(self,*exc): self.close()
+    def close(self):
+        if self._fd is not None: os.close(self._fd); self._fd=None
+
+    @contextmanager
+    def _read(self):
+        try:
+            with self.state.read_existing() as c: yield c
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"rollback protection could not be read ({exc}); {_REFUSED}") from None
+
+    @staticmethod
+    def _require_schema(c,*,current):
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE name='schema_version'").fetchone():
+            raise RuntimeError(f"UPT state database is not initialised; rollback protection cannot be verified, so {_REFUSED}")
+        if not current: return
+        from .state import CORE_SCHEMA_IDENTITY, CORE_SCHEMA_VERSION
+        version=c.execute("SELECT version FROM schema_version").fetchall()
+        identity=[tuple(row) for row in c.execute("SELECT singleton,identity FROM core_schema_identity")] \
+            if c.execute("SELECT 1 FROM sqlite_master WHERE name='core_schema_identity'").fetchone() else []
+        if [tuple(row) for row in version]!=[(CORE_SCHEMA_VERSION,)] or identity!=[(1,CORE_SCHEMA_IDENTITY)]:
+            raise RuntimeError(f"UPT state database schema is not compatible with this cleanup; {_REFUSED}")
+
+    def _require_identity(self):
+        try: current=os.stat(self.state.db_path)
+        except OSError: current=None
+        if self._fd is None or current is None or (current.st_dev,current.st_ino)!=self._identity:
+            raise RuntimeError(f"UPT state database was replaced during cleanup; {_REFUSED}")
+
+    def verify_connection(self,c):
+        """Validate protection on the connection whose mutation is authorised."""
+        self._require_identity()
+        if self.state.created_schema:
+            raise RuntimeError(f"UPT state database was initialised during this run; rollback protection cannot be verified, so {_REFUSED}")
+        self._require_schema(c,current=True)
+        values=[row[0] for row in c.execute(_CLEANUP_PROTECTED)]
+        # Retention matches stored IDs exactly, including expired refs.
+        recorded=[row[0] for row in c.execute("SELECT image_id FROM rollback_refs UNION ALL SELECT image_id FROM protected_images")]
+        self._require_identity()
+        if any(not isinstance(value,str) or canonical_image_id(value)!=value for value in recorded):
+            raise RuntimeError(f"rollback protection contains a non-canonical image identity; {_REFUSED}")
+        return frozenset(values)
+
+    def protection(self):
+        """Canonical IDs cleanup must keep, from one short read (no Docker inside)."""
+        self._require_identity()
+        with self._read() as c: return self.verify_connection(c)
+
+    @contextmanager
+    def connect(self):
+        """Cleanup-only gate on the actual write transaction and before commit.
+
+        Callers must keep Docker and filesystem effects outside this context.
+        State.connect retains ownership of BEGIN, commit and rollback.
+        """
+        self.protection()
+        with self.state.connect() as c:
+            self.verify_connection(c)
+            yield c
+            self.verify_connection(c)
+
+def cleanup_blocker(protection,image_id):
+    """Why canonical ``image_id`` must not be removed, or None if eligible."""
+    if canonical_image_id(image_id)!=image_id: return "INVALID IMAGE IDENTITY"
+    return "ROLLBACK PROTECTED" if image_id in protection else None
 
 def _utc(value=None):
     if value is None: return datetime.now(timezone.utc)
@@ -94,8 +202,23 @@ def _compose_artifacts(state, days, now):
     return artifacts
 
 
-def _cleanup_compose_artifact(state, path, days, now, dry_run):
+def _cleanup_compose_artifact(state, path, days, now, dry_run, cleanup_state=None):
     from .compose_recovery_retention import checked_bundle, lifecycle, remove_bundle
+    if cleanup_state:
+        # update.lock serialises automatic cleanup. Keep filesystem work out
+        # of SQLite transactions, and recheck at both mutation boundaries.
+        with checked_bundle(state.root, path) as bundle:
+            with state.read_existing() as c:
+                cleanup_state.verify_connection(c)
+                status, finished = lifecycle(c, path.name, bundle)
+            if status != "terminal" or not finished or not expired(finished, days, now):
+                raise ValueError("recovery evidence is protected")
+            if not dry_run:
+                cleanup_state.protection()
+                remove_bundle(path, bundle)
+                with cleanup_state.connect() as c:
+                    c.execute("DELETE FROM compose_recovery_receipts WHERE operation_id=?", (path.name,))
+        return
     # Serialize lifecycle proof/deletion against pruning and terminal writes.
     with state.connect() as c:
         with checked_bundle(state.root, path) as bundle:
@@ -107,9 +230,9 @@ def _cleanup_compose_artifact(state, path, days, now, dry_run):
                 c.execute("DELETE FROM compose_recovery_receipts WHERE operation_id=?", (path.name,))
 
 
-def _migrate_refs(state):
-    if not state.db_path.exists(): return
-    with state.connect() as c:
+def _migrate_refs(state,cleanup_state=None):
+    if not cleanup_state and not state.db_path.exists(): return
+    with (cleanup_state.connect() if cleanup_state else state.connect()) as c:
         c.execute("INSERT OR IGNORE INTO rollback_refs(history_id,image_id,created) " + _LEGACY_REF_CANDIDATES)
 
 def _docker_image_accounting():
@@ -190,9 +313,15 @@ def _container_image_ids():
     try: return {x.get("Image") for x in json.loads(run(["docker","inspect",*ids],timeout=60)) if x.get("Image")}
     except Exception: return set()
 
-def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now=None,service=None,stack=None,override_protection=False,all_protected=False):
-    if not dry_run: _migrate_refs(state)
+def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now=None,service=None,stack=None,override_protection=False,all_protected=False,revalidate=None,cleanup_state=None):
+    connect=cleanup_state.connect if cleanup_state else state.connect
+    if not dry_run and not cleanup_state: _migrate_refs(state)
     now=_utc(now); inv=inventory(cfg,state,now,image_details=True); expired_files=[x for x in inv["artifacts"]+inv["logs"] if x["expired"]]
+    # Inventory projects legacy refs without writing. Automatic cleanup must
+    # revalidate after inventory/accounting before materialising any of them.
+    if cleanup_state:
+        cleanup_state.protection()
+        if not dry_run: _migrate_refs(state,cleanup_state)
     if all_protected and service: raise ValueError("--all cannot be combined with --service")
     if stack and not service: raise ValueError("--stack requires --service")
     if override_protection and not service and not all_protected: raise ValueError("--override-protection requires --service or --all")
@@ -227,7 +356,7 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
         index+=1; path=Path(item["path"])
         if item["kind"] == "compose-recoveries":
             try:
-                _cleanup_compose_artifact(state, path, inv["settings"]["compose_backups_days"], now, dry_run)
+                _cleanup_compose_artifact(state, path, inv["settings"]["compose_backups_days"], now, dry_run, cleanup_state)
                 if not dry_run:
                     result["files_removed"] += 1
                     result["reclaimed"] += item["size"]
@@ -239,8 +368,10 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
         allowed=[state.root/d for d in MANAGED_DIRS if d != "compose-recoveries"]+[cfg.log_dir]
         if not any(path.parent.resolve()==root.resolve() for root in allowed): result["skipped"].append({"path":str(path),"reason":"OUTSIDE MANAGED ROOT"}); continue
         if dry_run: reporter.advance(index,task_total,path.name,"would purge"); continue
+        is_directory=path.is_dir()
+        if cleanup_state: cleanup_state.protection()
         try:
-            if path.is_dir(): shutil.rmtree(path)
+            if is_directory: shutil.rmtree(path)
             else: path.unlink()
             result["files_removed"]+=1; result["reclaimed"]+=item["size"]; reporter.advance(index,task_total,path.name,"purged")
         except OSError as e: result["skipped"].append({"path":str(path),"reason":str(e)}); reporter.warning(str(e),path.name)
@@ -254,7 +385,7 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
             if point["status"]!="EXPIRED" and point["history_id"] not in selected: grouped[point["image_id"]]+=1
         refs=list(grouped.items())
     else:
-        with state.connect() as c:
+        with connect() as c:
             purge_status="MANUALLY EXPIRED" if forced else "EXPIRED"
             warned=set()
             for point in points:
@@ -279,7 +410,7 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
             result["skipped"].append({"image":image_id,"reason":reason}); reporter.warning(reason,image_id[:19]); continue
         if image_id in in_use:
             reason="SKIPPED - IMAGE IN USE"; result["skipped"].append({"image":image_id,"reason":reason})
-            with state.connect() as c: c.execute("UPDATE rollback_refs SET purge_status=? WHERE image_id=? AND expired=1",(reason,image_id))
+            with connect() as c: c.execute("UPDATE rollback_refs SET purge_status=? WHERE image_id=? AND expired=1",(reason,image_id))
             reporter.warning(reason,image_id[:19]); continue
         info=next((p for p in image_points if p.get("unique_size") is not None),{})
         image_known=bool(info)
@@ -292,6 +423,13 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
                                              "service":image_points[0].get("service"),"reclaimable":max((p.get("potential_reclaimable",0) for p in image_points),default=0),
                                              "action":planned})
             reporter.advance(index,task_total,image_id[:19],action); continue
+        # Optional caller check (``upt cleanup``'s pinned state): a returned
+        # reason skips this image; raising stops the run and is not caught.
+        if cleanup_state: reason=cleanup_blocker(cleanup_state.protection(),image_id)
+        else: reason=revalidate(image_id) if revalidate else None
+        if reason:
+            reason="SKIPPED - "+reason; result["skipped"].append({"image":image_id,"reason":reason}); reporter.warning(reason,image_id[:19])
+            reporter.advance(index,task_total,image_id[:19],"skipped"); continue
         terminal=None
         try:
             run(["docker","image","rm",image_id],timeout=300)
@@ -301,12 +439,12 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
             if "no such image" in str(e).lower(): terminal="ALREADY ABSENT"; result["images_absent"]+=1
             else:
                 reason="SKIPPED - "+str(e); result["skipped"].append({"image":image_id,"reason":reason}); result["failures"].append({"image":image_id,"reason":str(e)})
-                with state.connect() as c: c.execute("UPDATE rollback_refs SET purge_status=? WHERE image_id=? AND expired=1",(reason,image_id))
+                with connect() as c: c.execute("UPDATE rollback_refs SET purge_status=? WHERE image_id=? AND expired=1",(reason,image_id))
                 reporter.warning(reason,image_id[:19]); continue
         except Exception as e:
             reason="SKIPPED - "+str(e); result["skipped"].append({"image":image_id,"reason":reason}); result["failures"].append({"image":image_id,"reason":str(e)})
             reporter.warning(reason,image_id[:19]); continue
-        with state.connect() as c:
+        with connect() as c:
             c.execute("UPDATE rollback_refs SET purge_status=? WHERE image_id=? AND expired=1",(terminal,image_id))
             c.execute("UPDATE history SET rollback_result=? WHERE id IN (SELECT history_id FROM rollback_refs WHERE image_id=? AND expired=1)",(terminal,image_id))
             c.execute("DELETE FROM protected_images WHERE image_id=? AND "+_resolved_protection(),(image_id,))
@@ -315,7 +453,7 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
         disk_cutoff=(now-timedelta(days=inv["settings"]["disk_history_days"])).strftime("%Y-%m-%d %H:%M:%S")
         resolved_cutoff=(now-timedelta(days=inv["settings"]["resolved_rollback_metadata_days"])).strftime("%Y-%m-%d %H:%M:%S")
         audit_cutoff=(now-timedelta(days=inv["settings"]["audit_history_days"])).strftime("%Y-%m-%d %H:%M:%S")
-        with state.connect() as c:
+        with connect() as c:
             before=c.total_changes
             c.execute("DELETE FROM disk_snapshots WHERE timestamp<?",(disk_cutoff,))
             # Retire resolved protections before their terminal refs, and keep a
@@ -329,6 +467,10 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
             c.execute("DELETE FROM history WHERE timestamp<? AND id NOT IN (SELECT history_id FROM rollback_refs)",(audit_cutoff,))
             c.execute("PRAGMA optimize")
             result["database"]["rows_pruned"]=c.total_changes-before
-        result["database"].update(state.compact_if_needed())
+        if cleanup_state:
+            cleanup_state.protection()
+            result["database"].update(state.compact_if_needed(verify_connection=cleanup_state.verify_connection))
+        else:
+            result["database"].update(state.compact_if_needed())
     reporter.finish(f"Retention cleanup complete: {result['files_removed']} artefact(s), {result['images_removed']} image(s), {result['images_absent']} absent image(s) reconciled")
     return result

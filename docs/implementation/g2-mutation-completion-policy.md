@@ -1,10 +1,10 @@
 # G2 — mutation completion and SQLite publication (design brief)
 
-**Status:** Design proposal for independent review; **not approved for implementation or merge**. Owner approval of this policy and of the open decisions below is required before any source change.
+**Status:** G2 policy decisions D1–D10 (including D3b and D3c) accepted as the author-approved design direction on 2026-10-16. PR #15 remains documentation-only and awaits final author review; this policy acceptance is not authorisation to implement S0b, migrate schema, merge or deploy.
 **Tracking:** [issue #9](https://github.com/rdna897/upt/issues/9) (S6-R1, R1b, R2, R3).
-**Prerequisites:** [Stage 6a transaction-ownership decision](stage6-sqlite-state-ownership-review.md); merged [G2 characterisation PR #13](https://github.com/rdna897/upt/pull/13); merged [R10 PR #14](https://github.com/rdna897/upt/pull/14).
+**Prerequisites and merged groundwork:** [Stage 6a ownership assessment](stage6-sqlite-state-ownership-review.md); [characterisation PR #13](https://github.com/rdna897/upt/pull/13), [R10 PR #14](https://github.com/rdna897/upt/pull/14), [S0a SQLite primitives PR #16](https://github.com/rdna897/upt/pull/16), and [cleanup protection PR #19](https://github.com/rdna897/upt/pull/19).
 **Deployment:** Production freeze remains in force. No Docker changes or live databases in development/tests.
-**S0 foundation:** [schema-10 recovery-fence design](g2-s0-recovery-fence-design.md), recommended after independent technical re-review of `740555e`. This is a planning direction, not owner approval. The `protected_images` upsert, summary-only CLI journal and shared bootstrap-fence designs are withdrawn.
+**S0 foundation:** [dedicated schema-10 recovery-fence design](g2-s0-recovery-fence-design.md), Option B selected as policy; exact DDL, offline migration, downgrade safety, operator release and web compatibility still need separate implementation approval. The `protected_images` upsert, summary-only CLI journal and shared bootstrap-fence designs are withdrawn.
 
 ## Problem and required contract
 
@@ -19,7 +19,9 @@ The proposal must specify, per mutation path:
 5. **Persistent unavailability:** distinguish observed success from unknown persistence; do not claim durable success if writes cannot be verified. Define explicit CLI exit/error output, agent logs and web operation visibility, including what a later operator must reconcile.
 6. **Transaction ownership:** preserve single-transaction atomic publication where required; do not hold SQLite transactions across Docker or Compose effects. Maintain core/web separation, existing locks and explicit schema migration/compatibility gates.
 
-## 1. Current behaviour by call path
+## 1. Mutation-path behaviour and historical defect baseline
+
+The mutation-publication faults remain G2 work. The dangling-image cleanup fault described in the historical baseline was separately fixed by merged PR #19; current cleanup validates full identities and rollback ownership.
 
 | Path | Completion write | What happens when it fails | Evidence |
 | --- | --- | --- | --- |
@@ -34,7 +36,7 @@ The proposal must specify, per mutation path:
 **Related surfaces** (the policy must not make them worse):
 
 - (a) CLI `main` catches only `ValueError, RuntimeError, CommandError, yaml.YAMLError` (`src/docker_update_manager/cli.py:540`); a raw `sqlite3.OperationalError` escapes as a traceback with exit status 1 instead of an `EXIT_*` code (`cli.py:26`: 0/10/20/30).
-- (b) `upt cleanup` removes dangling images not in `protected_images` (`cli.py:418-425`). After a mutable-tag update whose history row never committed, the previous image is dangling and unprotected, so the sole rollback image can be removed.
+- (b) **Historical defect resolved by PR #19:** cleanup used to compare abbreviated IDs and omit important protection. Current cleanup validates canonical IDs and existing rollback references. G2 still needs a distinct durable fence armed before a mutation because a successful workload without matching History can otherwise lack independent recovery ownership.
 - (c) `State.record` writes the history row, `protected_images` and `rollback_refs` in one transaction (`state.py:442-458`); today protection exists only if the completion row commits.
 - (d) Retention treats a `protected_images` row with no matching rollback ref (including a NULL `history_id`) as **unresolved** and refuses removal, even under `--override-protection` (`src/docker_update_manager/retention.py:19-31`, `:137-144`, merged in R10 #14). Retention deletes only resolved protection rows (`retention.py:312`, `:325`).
 - (e) `recover_abandoned_operations` (`state.py:777-866`) marks every stale active web update/rollback `failed` with "Agent stopped while this update was active" (`state.py:810-811`) without consulting History or any durable boundary marker. Only namespace update and Compose apply have durable markers.
@@ -169,7 +171,7 @@ A minimal audited operator-only release must exist before any G2 writer is activ
 
 ### P12 — Limited overlap with G3
 
-G2-S0 advances the minimum durable CLI completion identity, independent image/backup claims and audited release needed for G2 safety. Full G3 interruption journalling and guided reconciliation remain [issue #10](https://github.com/rdna897/upt/issues/10). Storage-independent **S0a** can be authorised independently of schema-10 design; S0b/S0c require further review and explicit owner approval.
+G2-S0 advances the minimum durable CLI completion identity, independent image/backup claims and audited release needed for G2 safety. Full G3 interruption journalling and guided reconciliation remain [issue #10](https://github.com/rdna897/upt/issues/10). Storage-independent **S0a** is merged in PR #16; S0b/S0c require separately scoped implementation authorisation and final author review.
 
 ## 5. Per-path application and manual reconciliation
 
@@ -216,10 +218,10 @@ Each slice replaces the matching characterisation tests in `tests/test_sqlite_co
 
 ## 7. Implementation slices
 
-Each slice needs a separate PR and independent review; this draft authorises **documentation only**. See the [schema-10 S0 proposal](g2-s0-recovery-fence-design.md).
+Each implementation slice needs a separate PR, passing exact-head validation and final author review; this design PR authorises **documentation only**. See the [schema-10 S0 proposal](g2-s0-recovery-fence-design.md).
 
-- **S0a — storage-independent:** classify SQLite errors before/during commit, allow per-call timeout under a monotonic publication deadline, and extend the synthetic fault harness. **No schema or observable workload change.** This may be independently approved before D10.
-- **S0b — schema-10 storage and inert enforcement:** independently approved, **offline** schema-9→10 transition; `completion_fences` and `completion_fence_claims` indexes; service/backup/image admission/removal predicates, migration/rollback gates, API/SSE redaction, safety tests. **No G2 writers enabled.** Preserve all existing namespace/bootstrap behaviour.
+- **S0a — completed and merged (PR #16):** before-/during-commit classification, per-call timeout and deterministic fault harness. No schema or workload changes. Integrating those primitives into the shared G2 publisher remains work for later implementation slices.
+- **S0b — proposed next separate implementation PR, not yet authorised:** explicit, **offline** schema-9→10 transition; `completion_fences` and `completion_fence_claims` indexes; service/backup/image admission/removal predicates, migration/rollback gates, API/SSE redaction, safety tests. **No G2 writers enabled.** Preserve all existing namespace/bootstrap behaviour.
 - **S0c — atomic publication and operator recovery:** guarded `State.record` transaction with exact History/fence resolution, non-destructive `protected_images` handling, post-arm/no-effect proof and minimal audited reconciliation. **Activate writers only with their corresponding S1/S2/S3 corrected completion handlers**, never in a half-enabled release.
 - **S1 (R1):** shared publisher, bounded retries, CLI error/log contract, ordinary update and per-service batch retention safety. Web update adapter **and post-restart P8 recovery must ship together** (D9 web compatibility prerequisite).
 - **S2 (R2):** pinned update without a database-triggered reversal; follow-on pin gating; namespace-consumer fence exclusion and regression protection.
@@ -230,31 +232,35 @@ Test gates include namespace-consumer update success unchanged; web internal own
 
 ## 8. Compatibility and rollout
 
-- **Schema 10 is proposed, not authorised.** It requires a separate offline quiescent 9→10 transition with snapshots, integrity checks and explicit operator approval. Schema-9 binaries refuse schema 10, mechanically preventing their image/backup cleanup from operating on new guard state.
+- **Schema 10 is the approved design direction, not an authorised migration.** It requires a separate offline quiescent 9→10 transition with snapshots, integrity checks and explicit operator approval. Schema-9 binaries refuse schema 10, mechanically preventing their image/backup cleanup from operating on new guard state.
 - The `core_schema_identity` trust contract and older version gate remain strict; avoid implicit migrations. Validate complete rollback eligibility: never restore a stale schema-9 snapshot over newer History or unresolved recovery claims.
 - Additive History `details` and web `summary/result` keys remain backward readable in the new binary, but schema 10 means **binary revert is not an authorised data rollback**. A supported state-preserving 10→9 route, if needed, must be separately designed and reviewed.
-- **D9 web `unresolved` status** remains a separate API/UI/SSE, frontend and older-web-compatibility decision. No G2 web completion path activates without its matching post-restart recovery.
+- **D9's `unresolved` status is approved as policy**; implementation still requires an API/UI/SSE, frontend and older-web-compatibility gate. No G2 web completion path activates without its matching post-restart recovery.
 - **Namespace/Compose compatibility:** dedicated G2 tables never replace `compose_bootstrap_fences`, existing namespace markers or their recovery receipts; service admission must check both systems. No automatic recovery replay.
 - Production deployment freeze remains in force. No stage implies deployment or restart.
 
-## 9. Decision register
+## 9. Approved decision register
 
-Provisional direction is as recorded from the owner's review instructions (2026-10-11). **None of these is final approval**; each needs explicit owner confirmation after the independent review.
+**Policy accepted by the author on 2026-10-16.** The decisions settle the architectural direction, not permission to merge PR #15, deploy, migrate production, or activate a fence writer. Evidence and compatibility gates below must be proved during separate, approved implementation slices.
 
-| ID | Decision | Provisional direction | Still requires |
-| --- | --- | --- | --- |
-| D1 | CLI exit status for factual success with unverified publication | 30 (`EXIT_FATAL`), with separate factual-success and publication-failure messages | Confirmation |
-| D2 | Web terminal status | `succeeded` with warning **only** when History is durably committed; otherwise unresolved | Confirmation; depends on D9 |
-| D3 | Image/backup protection and sequencing | Schema-10 owner-scoped fences and indexed image/backup claims; independent shared-image owners and stable service identity | Review proof model, complete admission/deletion coverage and atomic release |
-| D3b | Binary downgrade/partial-upgrade floor | Schema-9 binaries must refuse schema 10; never restore stale pre-upgrade state or silently run old cleanup over new claims | Approve offline 9→10 transition, compatibility tests and state-preserving downgrade gate |
-| D3c | Retain the exact backup of an unresolved completion past age expiry | **Required for S0**; skip guarded backups in inventory, real/forced retention and final delete revalidation; other backups retain normal TTL | Confirm path/ownership and safe-downgrade contract |
-| D4 | Rollback running-image identity guard (P9) | Accept, fail closed. Side effects: a second rollback after a completed rollback, and rollback after an out-of-band image change, are refused pending reconciliation | Confirmation |
-| D5 | Retry bound | One monotonic completion deadline (P4); recommended 60 s | Confirmation of the budget value |
-| D6 | Namespace-update ambiguous commit | Characterise first (tests only, S4); any fix is a separate decision | Confirmation |
-| D7 | Unrelated single-write mutation records (`do_pin` at `operations.py:70`, removal, others) | Defer with explicit tracking; open a tracking issue before S1 merges | Tracking issue creation |
-| D8 | Reconciliation tool | Require a **minimal audited operator-only fence reconciliation/release** before G2 writers activate; defer broader guided tooling to G3 | Owner approval of proof, audit and privilege requirements |
-| D9 | Status vocabulary for unverified outcomes | Recommended: new terminal operation status `unresolved` (API/UI contract change), used for unverified succeeded publication and for guard-present interrupted operations. Consider in-process uncertain outcomes separately | **Separate compatibility decision**, including SSE, polling and old web binaries; blocks S1, S3 and S4 |
-| D10 | Guard storage and admission | **Prefer Option B:** schema-10 `completion_fences` plus indexed `completion_fence_claims`, preserving bootstrap/namespace separation | Explicit owner approval after migration/admission/lifecycle design review; blocks S0b/S0c |
+| ID | Approved policy | Required implementation evidence / gate |
+| --- | --- | --- |
+| D1 | CLI exit `EXIT_FATAL` (30) for succeeded Docker work with unverified History; report workload success and publication failure separately. | Typed error, bounded/redacted CLI diagnostics, no automatic post-command retention. |
+| D2 | Web `succeeded` only when matching History has durably committed; unverified successful work is `unresolved`. | History/terminal read-back and restart recovery tests (D9). |
+| D3 | Dedicated service-scoped fences and independently owned image/backup claims; shared-image owners remain distinct and existing manual protections intact. | Stable-identity admission, all deletion guards, strict evidence and atomic release tests. |
+| D3b | Schema-9 binaries refuse schema 10; require an explicit offline, quiescent 9→10 transition, never restore stale schema-9 state over newer evidence. | Both UPT locks, validated backup, interruption/idempotence tests, old-binary refusal and a state-preserving downgrade/refusal gate. |
+| D3c | Preserve exact claimed backups while a completion remains unresolved, including beyond normal TTL and forced retention; other backups retain expiry. | Strict managed-root path/owner proofs and revalidation immediately before deletion. |
+| D4 | Fail closed on rollback when selected History's known `new_image_id` differs from the actual running image. | Out-of-band drift and second-rollback regressions. |
+| D5 | One 60-second monotonic completion deadline covering all completion-side SQLite reads/writes, retries and sleeps. | S0a primitives integrated without an additional operation after deadline; ambiguous outcomes reported truthfully. |
+| D6 | Preserve existing namespace fences; characterise ambiguous namespace update commits first and scope corrections separately. | Tests-only characterisation in S4 and namespace exclusion tests. |
+| D7 | Defer unrelated single-write mutation paths; create follow-on tracking before S1 merges. | Explicit inventory of `do_pin`, removal and remaining writers. |
+| D8 | Before any G2 fence writer activates, provide minimal audited **operator-only** named-fence reconciliation. No blind unlock or fabricated success. | Lock-held trusted local command, stable owner/service identity, running image, backup/source hashes, matching History, durable audit; if proof fails retain fence. Operator attestation alone is not an implied override. |
+| D9 | New terminal web `unresolved` status for successful but unpublished History and guard-present interrupted operations; keep observed workload outcome separate. | API/polling/SSE/UI and older-client compatibility, plus post-restart fail-closed recovery in the same activation slice. |
+| D10 | **Option B:** schema-10 `completion_fences` and indexed `completion_fence_claims`; keep namespace/bootstrap fences and `operation_runs` independent. | DDL/identity, claim lifecycle, privacy, cross-path enforcement and migration tests. |
+
+**Implementation order and controls:** S0a (#16) and cleanup protection (#19) are complete. PR #15 is documentation only. Following author review, S0b may be separately scoped and authorised for offline migration tooling, new storage and *inert* guards, with no new fence writers. S0c prepares atomic publication and audited release; activate a writer only together with its corrected S1/S2/S3 handler and tested operator release. G3 (#10) remains independent.
+
+**Deployment boundary:** No implicit schema 9→10 migration on startup. Production database migration, service restarts, Docker operations, deployment and rollback require their own explicit operator approval.
 
 ## 10. Risks
 
@@ -268,19 +274,19 @@ Provisional direction is as recorded from the owner's review instructions (2026-
 ## 11. Review history
 
 - **Initial technical review of the first draft** (commit `eb3bd3b`): corrected citations, the scope of the uncertain outcome, and the reconciliation gaps.
-- **Independent architecture review of `eb3bd3b`:** two High and two Medium findings, accepted after checking against the code:
+- **technical architecture review of `eb3bd3b`:** two High and two Medium findings, accepted after checking against the code:
   - (H1) P8 could not reconstruct an outcome from absent History → P8 rewritten as a fail-closed three-case contract with durable markers and an unresolved status (D9);
   - (H2) no durable protection when nothing commits → P11 pre-mutation marker with pending protection, enforced by existing cleanup/retention, sequenced as G2-S0 (P12);
   - (M3) retry after an ambiguous commit with a failed read could duplicate → P5 invariant and decision tree, `contradictory` outcome, tests 3–5;
   - (M4) the deadline bounded writes only → P4 single monotonic deadline covering every completion-side step.
-- **Independent review of `84d5170`:** identified manual ownership collision, expiry of backup evidence, missing mutation admission and inconsistent protocol capability; the first S0 architecture was proposed.
-- **Independent technical review of `8acdac5`:** H1–H4 found summary-only fencing incompatible with existing gate semantics, synthetic CLI web-operation lifecycle, no safe resolution path and non-atomic guard release. M1–M6 identified admission/removal bypasses, shared-image overblocking, web evidence leaks, missing rollback claims, batch retention and late post-restart recovery.
-- **Independent technical re-review of `740555e`:** shared `compose_bootstrap_fences` reuse conflicts with namespace updates, while new G2 fences require precise in-flight own-operation revalidation; schema 9 cannot mechanically exclude older cleaners. M1–M5 require protection ownership, stable identity, strict claims, release evidence and G2-only pruning. The [new S0 schema-10 proposal](g2-s0-recovery-fence-design.md) makes Option B the preferred planning direction, subject to owner approval.
+- **author review of `84d5170`:** identified manual ownership collision, expiry of backup evidence, missing mutation admission and inconsistent protocol capability; the first S0 architecture was proposed.
+- **technical review of `8acdac5`:** H1–H4 found summary-only fencing incompatible with existing gate semantics, synthetic CLI web-operation lifecycle, no safe resolution path and non-atomic guard release. M1–M6 identified admission/removal bypasses, shared-image overblocking, web evidence leaks, missing rollback claims, batch retention and late post-restart recovery.
+- **technical re-review of `740555e`:** shared `compose_bootstrap_fences` reuse conflicts with namespace updates, while new G2 fences require precise in-flight own-operation revalidation; schema 9 cannot mechanically exclude older cleaners. M1–M5 require protection ownership, stable identity, strict claims, release evidence and G2-only pruning. The [schema-10 design](g2-s0-recovery-fence-design.md) records Option B as the approved policy direction; implementation and deployment remain separately gated.
 
-## 12. Design acceptance gate
+## 12. Author review and implementation gates
 
-Before implementation: document each affected call path; a complete state/outcome matrix; no-database and ambiguous-commit behaviour; rollback-protection invariants; retry/reconciliation semantics; synthetic test plan; migration/compatibility impact; risks and open decisions. Obtain an independent review and explicit owner decision.
+**Policy direction:** D1–D10, including D3b and D3c, accepted by the author on 2026-10-16. This draft now records decisions rather than presenting them as outstanding policy choices. The design still requires final author review before PR #15 may merge.
 
-The independent review of this revised S0 boundary must be recorded, and owner decisions D1–D10 (including D3b and D3c) must be approved in this file. Only then may G2-S0 start in a separate PR. Pending status/ownership decisions are not implementation authorisation. S1–S4 additionally depend on the prerequisites listed in section 7.
+**Separate implementation authorisation:** Do not start S0b solely because the policy was accepted. First approve the exact offline migration scope, DDL, old-binary refusal, state-preserving downgrade/refusal proof, inert guard coverage and operator/recovery evidence. Subsequent S0c and S1–S4 need separately reviewed PRs, exact-head CI and explicit author approval. D9's web wire compatibility is an implementation gate, not permission to publish an incomplete status.
 
-**This draft authorises documentation and analysis only.** No `src/`, database/schema, CI-policy, live Docker or production changes. Do not merge the design PR without owner approval.
+**No production actions:** This PR changes documentation only. No source, schema, tests, CI policy, live Docker or production state, no deployment and no service restart. Preserve the deployment freeze.

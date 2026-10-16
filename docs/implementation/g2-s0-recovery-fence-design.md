@@ -1,22 +1,22 @@
 # G2-S0 — Recovery ownership and completion fence (schema-10 design)
 
-**Status:** Design proposal after independent architecture re-review of PR #15 at `740555e`. **Option B is the recommended planning direction, not owner approval or implementation authority.** See [G2 policy](g2-mutation-completion-policy.md), [G2 issue #9](https://github.com/rdna897/upt/issues/9), [G3 issue #10](https://github.com/rdna897/upt/issues/10).
-**Baseline:** public schema 9, merged G2 characterisation PR #13 and R10 PR #14.
+**Status:** Option B accepted as the G2 policy choice on 2026-10-16; this is documentation-only. S0b implementation, schema migration and deployment are **not** authorised by design approval. See [G2 policy](g2-mutation-completion-policy.md), [G2 issue #9](https://github.com/rdna897/upt/issues/9), [G3 issue #10](https://github.com/rdna897/upt/issues/10).
+**Baseline:** public schema 9; merged PRs #13 (characterisation), #14 (R10), #16 (S0a SQLite primitives) and #19 (cleanup protection).
 **Freeze:** No production deployment, service restart, schema migration or Docker/database mutation under this design PR.
 
-## 1. Decision D10 — select dedicated schema 10 (provisional)
+## 1. Decision D10 — dedicated schema 10 selected as policy
 
 | Candidate | Assessment |
 | --- | --- |
 | A — typed G2 evidence in `compose_bootstrap_fences` | **Rejected for G2:** namespace-consumer updates also insert a fence for the same logical key and operation ID, causing UNIQUE/PK collisions after image pull. Old R10 cleanup does not understand new image/backup claims. Mixed G2 and legacy evidence increases failure-domain coupling. |
-| **B — `completion_fences` and `completion_fence_claims` in schema 10** | **Preferred:** dedicated durable owner identity, typed indexed image/backup claims, separate namespace/bootstrap lifecycle, mechanical old-binary schema refusal. Requires independently approved offline 9→10 migration, no silent auto-migration, and a guarded release/downgrade plan. |
+| **B — `completion_fences` and `completion_fence_claims` in schema 10** | **Selected:** dedicated durable owner identity, typed indexed image/backup claims, separate namespace/bootstrap lifecycle, mechanical old-binary schema refusal. Requires separately approved offline 9→10 migration, no silent auto-migration, and a guarded release/downgrade plan. |
 | C — `operation_runs.summary` only | **Rejected:** not reliably enforced by existing gates; new CLI `operation_runs` rows collide with web-only active and abandonment semantics. |
  
 **Important:** Option B fixes the shared-table collision and adds a schema-level *binary compatibility check*; it does **not** itself solve own-operation admission, identity drift, truthful publication, operator release or retention. Those remain acceptance gates below.
 
 ## 2. Storage contract and offline migration
 
-Proposed schema additions (illustrative; exact DDL reviewed before coding):
+Approved conceptual storage shape (illustrative; exact DDL, compatibility and data-migration proofs require separate author review before coding):
 
 - `completion_fences(operation_id TEXT PRIMARY KEY, logical_key TEXT NOT NULL, stack TEXT NOT NULL, compose_service TEXT NOT NULL, action TEXT CHECK(...), lifecycle TEXT CHECK(lifecycle IN ('active','manual','resolved')), evidence TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`. An unresolved partial UNIQUE index on `logical_key` permits one active/manual fence per *logical service*.
 - `completion_fence_claims(operation_id TEXT NOT NULL REFERENCES completion_fences(operation_id) ON DELETE RESTRICT, kind TEXT CHECK(kind IN ('image','backup')), value TEXT NOT NULL, PRIMARY KEY(operation_id,kind,value))`. Index `(kind,value)` for many owners of a shared image or backup.
@@ -67,11 +67,11 @@ Do not put target image IDs in the *initial* guard when a mutable tag is not yet
 
 ## 6. Test gates and implementation order
 
-- **S0a — storage-independent:** before-/during-commit classification and per-call SQLite timeout under one monotonic deadline; deterministic fault-injection harness. No change to workloads or schema. May be reviewed/approved *separately* while D10 is pending.
-- **S0b — schema and inert enforcement:** independently approved explicit offline schema 9→10 migration; two dedicated tables and indexes; guard admission/image/backup/downgrade predicates; privilege/redaction coverage; namespace/bootstrap regression tests. No active new G2 writers yet.
+- **S0a — completed (merged PR #16):** before-/during-commit classification, per-call SQLite timeout and deterministic fault-injection harness. No workload or schema changes.
+- **S0b — next proposed separate PR, not yet authorised:** explicitly approved offline schema 9→10 migration; two dedicated tables and indexes; guard admission/image/backup/downgrade predicates; privilege/redaction coverage; namespace/bootstrap regression tests. No active new G2 writers yet.
 - **S0c — owner-scoped atomic publication and recovery:** shared `State.record` transaction composition, evidence enrichment, blocked/no-effect lifecycle, minimal audited release, and fault/rollback tests. Activate each fence writer **with** the corresponding fixed S1/S2/S3 completion error handler, not before.
 - **S1:** ordinary CLI update fix and batch-retention guards; web update completion *and post-restart recovery* together (D9 required). **S2:** pinned update, including namespace exclusion. **S3:** CLI/web rollback, pre-rollback backup and identity guard. **S4:** Compose Apply integration and cross-path verification, separately authorised.
 
 Mandatory synthetic tests: schema 9→10 offline transition and no silent startup migration, schema-9 binary refusal on schema 10, 10→9 rollback gate; namespace-consumer path unchanged; internal web own-fence revalidation; missing/conflicting logical-key service paths and stable identity drift; shared images independent owners; NULL manual protection byte-for-byte unchanged; ambiguous fence/History commits; atomic resolution rowcount failure; in-flight before/after evidence enrichment; guarded and ordinary backup TTL; forced retention, `remove --images`, `upt cleanup`; restart/convert/remove/restore-compose; batch CLI partial failures followed by automatic retention; CLI-only crash; HTTP/SSE privacy; malformed evidence; resolved fence pruning preserving namespace receipts.
 
-**Approval gates:** D3, D3b, D3c, D8, D9 and **D10** remain provisional. S0b and all writers require independent architecture acceptance, owner sign-off and a separate implementation PR. The deployment freeze remains in force.
+**Approval gates:** D3, D3b, D3c, D8, D9 and D10 are accepted **policy choices**, not tested implementations. S0b requires a separately approved offline migration/storage/inert-enforcement PR and final author review. No fence writer activates until audited operator recovery and the matching corrected mutation path exist. D9's API/UI/SSE and restart compatibility must be tested before web activation. The deployment freeze remains in force.
