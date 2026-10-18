@@ -68,7 +68,7 @@ Do not put target image IDs in the *initial* guard when a mutable tag is not yet
 ## 6. Test gates and implementation order
 
 - **S0a — completed (merged PR #16):** before-/during-commit classification, per-call SQLite timeout and deterministic fault-injection harness. No workload or schema changes.
-- **S0b — next proposed separate PR, not yet authorised:** explicitly approved offline schema 9→10 migration; two dedicated tables and indexes; guard admission/image/backup/downgrade predicates; privilege/redaction coverage; namespace/bootstrap regression tests. No active new G2 writers yet.
+- **S0b — implementation PR open for final author review** ([record](g2-s0b-schema10-implementation.md)): explicitly approved offline schema 9→10 migration; two dedicated tables and indexes; guard admission/image/backup/downgrade predicates; privilege/redaction coverage; namespace/bootstrap regression tests. No active new G2 writers yet.
 - **S0c — owner-scoped atomic publication and recovery:** shared `State.record` transaction composition, evidence enrichment, blocked/no-effect lifecycle, minimal audited release, and fault/rollback tests. Activate each fence writer **with** the corresponding fixed S1/S2/S3 completion error handler, not before.
 - **S1:** ordinary CLI update fix and batch-retention guards; web update completion *and post-restart recovery* together (D9 required). **S2:** pinned update, including namespace exclusion. **S3:** CLI/web rollback, pre-rollback backup and identity guard. **S4:** Compose Apply integration and cross-path verification, separately authorised.
 

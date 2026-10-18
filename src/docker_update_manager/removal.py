@@ -1,7 +1,8 @@
 """Explicit service removal with opt-in, ownership-checked data purging."""
 from __future__ import annotations
-import json, os, shutil
+import json, os, shutil, sqlite3
 from pathlib import Path
+from .completion_fence import CompletionFenceError
 from .compose_namespace import require_mutation_safe
 from .docker import compose_args, discover
 from .reconciliation import mark_changed, reconcile_operation
@@ -39,6 +40,11 @@ def _other_active_rollback(state,image_id,service):
         values.extend(own_history_ids)
     with state.connect() as c:
         return bool(c.execute("SELECT 1 FROM rollback_refs r JOIN history h ON h.id=r.history_id WHERE r.image_id=? AND r.expired=0"+exclusion+" LIMIT 1",values).fetchone())
+
+def _claim_status(state,image_id):
+    """Fresh G2 claim read before an image decision; failure keeps the image."""
+    try: return "UNRESOLVED RECOVERY CLAIM" if image_id in state.completion_claims()["image"] else None
+    except (CompletionFenceError,sqlite3.Error): return "RECOVERY CLAIMS UNVERIFIABLE"
 
 def _overlap(a,b):
     try: a.relative_to(b); return True
@@ -129,6 +135,7 @@ def _delete_path(path):
 @reconcile_operation
 def remove_service(s,state,*,images=False,purge_data=False,dry_run=False,yes=False,input_fn=input,reporter=NULL_REPORTER):
     require_mutation_safe(s)
+    state.assert_completion_unfenced(s)
     remove_cmd=(compose_args(s)+["rm","--stop","--force",s.key]) if s.stack else ["docker","rm","--force",s.container_id]
     rollback_images=_service_rollback_images(state,s) if images else []
     candidates=list(dict.fromkeys([s.image_id,*rollback_images])) if images else []
@@ -150,6 +157,7 @@ def remove_service(s,state,*,images=False,purge_data=False,dry_run=False,yes=Fal
             in_use=_remaining_container_images(exclude_id=s.container_id)
             for image_id in candidates:
                 if image_id in in_use: status="SKIP — used by another container"
+                elif claim:=_claim_status(state,image_id): status=f"SKIP — {claim.lower()}"
                 elif _other_active_rollback(state,image_id,s): status="SKIP — protected by another service"
                 else: status="WOULD REMOVE"
                 print(f"  {image_id[:19]:<20} {status}")
@@ -174,6 +182,7 @@ def remove_service(s,state,*,images=False,purge_data=False,dry_run=False,yes=Fal
         if not yes and reporter.prompt(f"Permanently remove {s.key} {noun}? Volumes and configuration will be preserved. [y/N] ",input_fn).strip().lower() not in {"y","yes"}:
             print("Cancelled; nothing removed."); return {"removed":False,"images_removed":[],"skipped":[]}
     require_mutation_safe(s)
+    state.assert_completion_unfenced(s)
     with reporter.task("Removing service container",service=s.key):
         mark_changed()
         run(remove_cmd,cwd=s.working_dir if s.stack else None,timeout=600)
@@ -211,6 +220,8 @@ def remove_service(s,state,*,images=False,purge_data=False,dry_run=False,yes=Fal
         for image_id in candidates:
             if image_id in in_use: skipped.append((image_id,"IMAGE IN USE")); continue
             if _other_active_rollback(state,image_id,s): skipped.append((image_id,"OTHER ACTIVE ROLLBACK")); continue
+            # Immediately before Docker: an unresolved G2 claim always keeps the image.
+            if claim:=_claim_status(state,image_id): skipped.append((image_id,claim)); continue
             try: run(["docker","image","rm",image_id],timeout=300); removed.append(image_id)
             except Exception as exc: skipped.append((image_id,str(exc)))
         reporter.stage(6 if purge_data else 4,total,"Remove eligible images",service=s.key)

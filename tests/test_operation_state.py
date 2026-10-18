@@ -27,11 +27,13 @@ class OperationStateTests(unittest.TestCase):
             connection.execute("DROP TABLE IF EXISTS compose_bootstrap_fences")
             connection.execute("UPDATE schema_version SET version=4")
 
-        migrated = State(self.state.root)
+        with self.assertRaisesRegex(RuntimeError, "legacy schema 4"):
+            State(self.state.root).history()
+        migrated = State(self.state.root, quiescent_transition=True)
         self.assertEqual(migrated.history()[0]["service"], "sonarr")
         with migrated.read() as connection:
             self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone()[0], 9)
-            self.assertEqual(CORE_SCHEMA_VERSION, 9)
+            self.assertEqual(CORE_SCHEMA_VERSION, 10)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(connection.execute("SELECT name FROM sqlite_master WHERE name='operation_runs'").fetchone()[0], "operation_runs")
 

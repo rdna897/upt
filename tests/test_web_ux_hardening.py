@@ -32,9 +32,9 @@ class PersistenceHardeningTests(unittest.TestCase):
         calls = []
         migrate = self.state._migrate
 
-        def counted(connection):
+        def counted(connection, **options):
             calls.append(1)
-            migrate(connection)
+            migrate(connection, **options)
 
         self.state._migrate = counted
         self.assertIsNone(self.state.latest_scan())
@@ -138,7 +138,9 @@ class PersistenceHardeningTests(unittest.TestCase):
             connection.execute("DROP TABLE IF EXISTS compose_bootstrap_fences")
             connection.execute("UPDATE schema_version SET version=3")
             connection.execute("ALTER TABLE scan_runs DROP COLUMN maintenance_warning")
-        repaired = State(self.state.root).latest_scan()
+        with self.assertRaisesRegex(RuntimeError, "legacy schema 3"):
+            State(self.state.root).latest_scan()
+        repaired = State(self.state.root, quiescent_transition=True).latest_scan()
         self.assertEqual(repaired["scan_id"], "good")
         self.assertEqual(repaired["status"], "complete")
         self.assertEqual(repaired["payload"]["services"], good_services)
@@ -154,12 +156,12 @@ class PersistenceHardeningTests(unittest.TestCase):
             connection.execute("DROP TABLE IF EXISTS compose_bootstrap_fences")
             connection.execute("UPDATE schema_version SET version=3")
             connection.execute("ALTER TABLE scan_runs DROP COLUMN maintenance_warning")
-        repaired = State(self.state.root).latest_scan()
+        repaired = State(self.state.root, quiescent_transition=True).latest_scan()
         self.assertEqual(repaired["status"], "stale")
         self.assertIsNone(repaired["finished_at"])
 
     def test_core_and_web_schema_versions_are_explicit_and_web_v3_upgrade_preserves_data(self):
-        self.assertEqual(CORE_SCHEMA_VERSION, 9)
+        self.assertEqual(CORE_SCHEMA_VERSION, 10)
         self.assertEqual(WEB_SCHEMA_VERSION, 4)
         web = WebState(Path(self.tmp.name) / "web-state")
         user_id = web.create_user("admin", "hash-only")

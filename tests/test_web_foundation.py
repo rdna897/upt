@@ -103,7 +103,9 @@ class WebFoundationTests(unittest.TestCase):
         conn = sqlite3.connect(db)
         conn.executescript("CREATE TABLE history(id INTEGER PRIMARY KEY, service TEXT NOT NULL, action TEXT NOT NULL, result TEXT NOT NULL); INSERT INTO history(service,action,result) VALUES('sonarr','update','SUCCESS');")
         conn.commit(); conn.close()
-        state = State(root)
+        with self.assertRaisesRegex(RuntimeError, "unversioned"):
+            State(root).history()
+        state = State(root, quiescent_transition=True)
         self.assertEqual(state.history()[0]["service"], "sonarr")
         with state.connect() as c:
             self.assertEqual(c.execute("SELECT version FROM schema_version").fetchone()[0], 9)

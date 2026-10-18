@@ -15,7 +15,7 @@ from unittest.mock import patch
 from docker_update_manager.compose_drift import read_input
 from docker_update_manager.compose_reconcile import RecoveryBundle
 from docker_update_manager.compose_recovery_retention import checked_bundle, lifecycle
-from docker_update_manager.state import State
+from docker_update_manager.state import CORE_SCHEMA_VERSION, State
 from docker_update_manager.retention import cleanup, inventory
 from test_disk_retention import Cfg
 
@@ -48,7 +48,11 @@ class StateRollbackCompatibilityTests(unittest.TestCase):
                 tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name!='schema_version'")]
                 rows = {name:[tuple(row) for row in c.execute('SELECT * FROM '+name)] for name in tables}
             transition(root,confirm_quiescent=True)
-            current = State(root)
+            # The schema-10 binary's 8-to-9 action is unchanged; schema 9 is then
+            # opened only by transition instances until upgrade-schema10 runs.
+            with self.assertRaisesRegex(RuntimeError,'schema-10 transition'):
+                State(root).ensure_compatible()
+            current = State(root, quiescent_transition=True)
             for _ in range(2):
                 current.ensure_compatible()
                 with current.read() as c:
@@ -98,7 +102,7 @@ class StateRollbackCompatibilityTests(unittest.TestCase):
             old = production.State(root)
             old.record(service='synthetic',action='update',result='SUCCESS')
             transition(root,confirm_quiescent=True)
-            state = State(root)
+            state = State(root, quiescent_transition=True)
             evidence = root/'compose-recoveries'/'unpublished'
             evidence.mkdir(parents=True)
             (evidence/'private').write_text('synthetic')
@@ -123,7 +127,7 @@ class StateRollbackCompatibilityTests(unittest.TestCase):
                 old.record(service='synthetic',action='update',result='SUCCESS')
                 with old.connect() as c:
                     c.execute('UPDATE schema_version SET version=?',(version,))
-                with self.assertRaisesRegex(RuntimeError,'unsupported'):
+                with self.assertRaisesRegex(RuntimeError,'unsupported' if version == 99 else 'schema-10 transition'):
                     State(root).history()
                 with sqlite3.connect(root/'history.sqlite3') as c:
                     self.assertEqual(c.execute('SELECT version FROM schema_version').fetchone()[0],version)
@@ -131,12 +135,13 @@ class StateRollbackCompatibilityTests(unittest.TestCase):
                     self.assertEqual(c.execute('SELECT count(*) FROM history').fetchone()[0],1)
 
     def test_v1_bundle_remains_readable_and_archives_receipt_after_schema9_transition(self):
-        from docker_update_manager.state_transition import transition
+        from docker_update_manager.state_transition import transition, upgrade_schema10
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             old = production.State(root)
             old.record(service='synthetic',action='update',result='SUCCESS')
             transition(root,confirm_quiescent=True)
+            self.assertEqual(upgrade_schema10(root,confirm_quiescent=True),'migrated')
             state = State(root)
             source = root/'fixture.yml'; source.write_text('synthetic')
             inputs = SimpleNamespace(files=(read_input('compose',str(source)),))
@@ -165,7 +170,7 @@ class StateRollbackCompatibilityTests(unittest.TestCase):
             root = Path(tmp)
             new = State(root); new.ensure_compatible()
             old = hardened.State(root)
-            with self.assertRaisesRegex(RuntimeError,'unsupported core state database schema version 9'):
+            with self.assertRaisesRegex(RuntimeError,f'unsupported core state database schema version {CORE_SCHEMA_VERSION}'):
                 old.ensure_compatible()
             with self.assertRaises(RuntimeError):
                 old.record(service='forbidden',action='update',result='SUCCESS')

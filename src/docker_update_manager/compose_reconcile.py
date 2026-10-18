@@ -132,6 +132,7 @@ def do_compose_reconcile(service, state, plan, *, operation_id, binding,
     a guard the only recovery is the qualified completed-zero desired
     startup/health failure; every other post-marker failure is manual.
     """
+    state.assert_completion_unfenced(service)  # before any bundle, source or runtime effect
     command = compose_args(service, project_name=service.stack) + [
         "up", "-d", "--no-deps", "--pull", "never"] + (["--no-build"] if guard else []) + [service.compose_service]
     boundary = False

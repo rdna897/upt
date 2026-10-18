@@ -261,6 +261,7 @@ def do_compose_discard(service, state, plan, *, operation_id, binding, revalidat
                        discover_current, verify_configuration, verify_context,
                        mutation_started=lambda: None, reporter=NULL_REPORTER, dry_run=False):
     """Caller holds the shared mutation lock; one source write and one recovery."""
+    state.assert_completion_unfenced(service)  # before any bundle, source or runtime effect
     boundary = False
     bundle = None
     mutation = plan.discard_plan

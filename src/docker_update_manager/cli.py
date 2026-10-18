@@ -323,6 +323,7 @@ def execute(args,p,cfg,state,reporter=NULL_REPORTER):
         # Refuse the whole selection before restarting any member.
         for s in targets:
             require_mutation_safe(s)
+            state.assert_completion_unfenced(s)
         for i,s in enumerate(targets,1):
             do_restart(s, state=state, dry_run=args.dry_run, reporter=reporter,post_mutation=partial(queue_agent_verification, state=state),reconcile_discover=lambda: discover(cfg,all_containers=True))
             reporter.advance(i,len(targets),s.key,"planned" if args.dry_run else "restarted")
@@ -398,6 +399,8 @@ def restore(state,args,reporter=NULL_REPORTER):
     d=Path(args.backup) if args.backup else choices[0]
     if not d.is_absolute(): d=root/d
     meta=json.loads((d/"metadata.json").read_text()); print(f"Backup: {d}")
+    # Restoring rewrites whole Compose sources, so any fenced service they define is affected.
+    state.assert_sources_unfenced([x["source"] for x in meta["files"]],stack=meta.get("stack"),compose_service=meta.get("service"))
     for x in meta["files"]: print(f"  {x['backup']} -> {x['source']}")
     if args.dry_run: reporter.stage(1,3,"Read backup metadata"); reporter.stage(2,3,"Back up current files (not executed)","pending"); reporter.stage(3,3,"Restore files (not executed)","pending"); reporter.finish("Restore dry run complete"); print("DRY RUN — no files restored."); return
     if not args.yes and input("Restore these files? [y/N] ").lower() not in {"y","yes"}: return

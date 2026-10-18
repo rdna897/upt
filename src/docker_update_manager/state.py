@@ -9,6 +9,7 @@ import sqlite3
 import threading
 from .progress import BOOTSTRAP_STAGE_TOTAL, UPDATE_STAGE_TOTAL, RECONCILE_STAGE_TOTAL, UPDATE_RECORD_LABEL
 from .sqlite_outcome import AMBIGUOUS, NOT_COMMITTED, OwnedTransaction, WriteOutcomeError, sqlite_timeout
+from . import completion_fence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -117,7 +118,12 @@ VERIFICATION_IDENTITY_FIELDS = (
     "state", "stack", "compose_service", "working_dir", "compose_files",
     "restart_policy", "local_build", "ignored",
 )
-CORE_SCHEMA_VERSION = 9
+# Schema 10 adds the G2 completion fence/claim tables (completion_fence.py).
+# Existing schema-9 state changes only through the explicit offline
+# state_transition upgrade-schema10 action, never on open.
+CORE_SCHEMA_VERSION = 10
+SCHEMA9_VERSION = 9
+# Immutable since schema 9 and retained unchanged by schema 10.
 CORE_SCHEMA_IDENTITY = "upt-compose-bootstrap-phase2b2-v1"
 BOOTSTRAP_SCHEMA = """
 CREATE TABLE core_schema_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), identity TEXT NOT NULL);
@@ -177,6 +183,9 @@ class State:
         self._schema_lock = threading.Lock()
         self._schema_ready = False
         self._schema_version = None
+        # Offline transition instances only: permits the existing schema-8 to 9
+        # migration and validates schema 9. Schema 9 to 10 is performed solely
+        # by state_transition.upgrade_schema10.
         self._quiescent_transition = quiescent_transition
         # Set once this instance initialises a database that had no schema.
         self.created_schema = False
@@ -235,7 +244,13 @@ class State:
                     self._schema_ready = False
                     raise RuntimeError('unsupported schema-9 identity') from None
                 if len(identity) == 1 and tuple(identity[0]) == (1, CORE_SCHEMA_IDENTITY):
-                    return
+                    if self._schema_version < CORE_SCHEMA_VERSION:
+                        return  # Offline transition instance validating schema 9.
+                    with self.read() as c:
+                        if completion_fence.schema_matches(c):
+                            return
+                    self._schema_ready = False
+                    raise RuntimeError('unsupported schema-10 completion fence schema')
         self._ensure_schema(recheck=True)
 
     def _ensure_schema(self, recheck=False, timeout=None):
@@ -250,6 +265,9 @@ class State:
             try:
                 if self._require_existing:
                     self._require_schema_table(connection)
+                if self.core_schema_identity is not None:
+                    # Refuse before any write, including the journal-mode change.
+                    self._core_target(*self._stored_version(connection))
                 # WAL is configured before the migration transaction. Normal
                 # reads then use deferred read transactions and never reserve
                 # the single SQLite writer slot.
@@ -257,12 +275,13 @@ class State:
                 connection.execute("BEGIN IMMEDIATE")
                 if self._require_existing:
                     self._require_schema_table(connection)
-                old = connection.execute("SELECT name FROM sqlite_master WHERE name='schema_version'").fetchone()
-                version = connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone() if old else None
-                if self.core_schema_identity is not None and version and int(version[0]) == 8 and not self._quiescent_transition:
-                    raise RuntimeError("schema 8 to 9 requires the offline quiescent state transition")
+                version, fresh = self._stored_version(connection)
                 created = not version
-                self._migrate(connection)
+                if self.core_schema_identity is None:
+                    self._migrate(connection)
+                else:
+                    # Re-proved under the write reservation.
+                    self._migrate(connection, target=self._core_target(version, fresh=fresh))
                 version = int(connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone()[0])
                 connection.commit()
                 self.created_schema = self.created_schema or created
@@ -279,6 +298,39 @@ class State:
                 raise
             finally:
                 connection.close()
+
+    @staticmethod
+    def _stored_version(connection):
+        old = connection.execute("SELECT name FROM sqlite_master WHERE name='schema_version'").fetchone()
+        version = connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone() if old else None
+        fresh = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() is None
+        return version, fresh
+
+    def _core_target(self, version, fresh):
+        """Schema version this instance may migrate to; refuse anything implicit."""
+        if fresh:
+            return CORE_SCHEMA_VERSION  # New state: nothing exists to convert.
+        stored = version[0] if version else None
+        if self._quiescent_transition and version is None:
+            return SCHEMA9_VERSION  # Explicit offline instance: unversioned legacy history.
+        if type(stored) is not int or stored < 1:
+            raise RuntimeError("UPT state database is unversioned or invalid; refusing to convert it")
+        if stored > CORE_SCHEMA_VERSION:
+            raise RuntimeError(f"unsupported core state database schema version {stored}")
+        if self._quiescent_transition:
+            if stored > SCHEMA9_VERSION:
+                raise RuntimeError(f"schema {stored} state cannot be opened by the schema-8 to 9 transition")
+            return SCHEMA9_VERSION
+        if stored == CORE_SCHEMA_VERSION:
+            return CORE_SCHEMA_VERSION
+        if stored == SCHEMA9_VERSION:
+            raise RuntimeError("schema 9 state requires the explicit offline schema-10 transition: stop all UPT "
+                               "processes, then run python -m docker_update_manager.state_transition "
+                               "upgrade-schema10 --state-dir DIR --confirm-quiescent")
+        if stored == 8:
+            raise RuntimeError("schema 8 to 9 requires the offline quiescent state transition")
+        raise RuntimeError(f"legacy schema {stored} state requires an explicit offline transition; "
+                           "refusing to convert it")
 
     @staticmethod
     def _require_schema_table(connection):
@@ -434,7 +486,7 @@ class State:
                 c.execute(statement)
 
     @classmethod
-    def _migrate(cls, c):
+    def _migrate(cls, c, target=CORE_SCHEMA_VERSION):
         c.execute("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL)")
         row = c.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
         version = int(row[0]) if row else 0
@@ -493,16 +545,34 @@ class State:
             for action in ('UPDATE','DELETE'):
                 c.execute(f"CREATE TRIGGER core_schema_identity_no_{action.lower()} BEFORE {action} ON core_schema_identity BEGIN SELECT RAISE(ABORT,'immutable schema identity'); END")
             c.execute("UPDATE schema_version SET version=9")
+            version = 9
         else:
-            try:
-                identity = c.execute("SELECT singleton,identity FROM core_schema_identity").fetchall()
-                fence_columns = {row[1] for row in c.execute("PRAGMA table_info(compose_bootstrap_fences)")}
-            except sqlite3.DatabaseError:
-                raise RuntimeError("unsupported schema-9 identity") from None
-            if (len(identity) != 1 or tuple(identity[0]) != (1, CORE_SCHEMA_IDENTITY)
-                    or fence_columns != {"logical_key", "operation_id", "evidence", "lifecycle", "created_at", "updated_at"}):
-                raise RuntimeError("unsupported schema-9 identity")
+            cls._validate_schema9_identity(c)
+        if target > SCHEMA9_VERSION:
+            if version < CORE_SCHEMA_VERSION:
+                # Callers reach this only for fresh state or the explicit
+                # offline transition, in this same transaction.
+                if c.execute("SELECT 1 FROM sqlite_master WHERE name LIKE '%completion%'").fetchone():
+                    raise RuntimeError("unexpected schema-10 objects in schema-9 state; refusing to migrate")
+                completion_fence.create_schema(c)
+                c.execute("UPDATE schema_version SET version=?", (CORE_SCHEMA_VERSION,))
+                version = CORE_SCHEMA_VERSION
+            if not completion_fence.schema_matches(c):
+                raise RuntimeError("unsupported schema-10 completion fence schema")
+        elif version > SCHEMA9_VERSION:
+            raise RuntimeError(f"unsupported core state database schema version {version}")
         cls._ensure_extensions(c)
+
+    @staticmethod
+    def _validate_schema9_identity(c):
+        try:
+            identity = c.execute("SELECT singleton,identity FROM core_schema_identity").fetchall()
+            fence_columns = {row[1] for row in c.execute("PRAGMA table_info(compose_bootstrap_fences)")}
+        except sqlite3.DatabaseError:
+            raise RuntimeError("unsupported schema-9 identity") from None
+        if (len(identity) != 1 or tuple(identity[0]) != (1, CORE_SCHEMA_IDENTITY)
+                or fence_columns != {"logical_key", "operation_id", "evidence", "lifecycle", "created_at", "updated_at"}):
+            raise RuntimeError("unsupported schema-9 identity")
 
     @staticmethod
     def _ensure_extensions(c):
@@ -1186,6 +1256,35 @@ class State:
                 raise ValueError('namespace_update_unresolved: manual recovery is required')
             if self.bootstrap_fence(key):
                 raise ValueError("bootstrap_unresolved: manual recovery is required")
+        self.assert_completion_unfenced(service)
+
+    # G2 schema-10 recovery fences: read-only predicates only (S0b). --------
+    def completion_fences(self):
+        """Validated unresolved G2 fences; malformed evidence raises."""
+        with self.read() as c:
+            return completion_fence.unresolved_fences(c)
+
+    def completion_claims(self):
+        """Validated claims of unresolved G2 owners, keyed by claim kind."""
+        with self.read() as c:
+            return completion_fence.unresolved_claims(c)
+
+    def assert_completion_unfenced(self, service):
+        """Refuse mutating a service an unresolved G2 completion still owns.
+
+        No owner exemption exists: an operation's own-fence revalidation needs
+        separately trusted context and is not part of this inert stage.
+        """
+        reason = completion_fence.service_refusal(self.completion_fences(), service)
+        if reason:
+            raise completion_fence.CompletionFenceError(reason)
+
+    def assert_sources_unfenced(self, paths, *, stack=None, compose_service=None):
+        """Refuse rewriting Compose sources that define a fenced service."""
+        reason = completion_fence.source_refusal(self.completion_fences(), paths, stack=stack,
+                                                 compose_service=compose_service)
+        if reason:
+            raise completion_fence.CompletionFenceError(reason)
 
     def namespace_update_fence(self, key):
         """The existing operation journal is authority, including after interruption."""

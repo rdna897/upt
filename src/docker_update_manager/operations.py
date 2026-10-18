@@ -439,6 +439,7 @@ def do_web_rollback(s, row, state, *, sources, operation_id, rollback_command,
     from .system import CommandError
 
     require_mutation_safe(s)
+    state.assert_completion_unfenced(s)
 
     expected_command=compose_args(s,project_name=s.stack)+["up","-d","--no-deps","--pull","never",s.compose_service]
     if rollback_command!=expected_command or recovery_command!=expected_command:
@@ -614,6 +615,8 @@ def do_web_rollback(s, row, state, *, sources, operation_id, rollback_command,
 @reconcile_operation
 def do_restart(service, *, state=None, dry_run=False, reporter=NULL_REPORTER, output=print):
     require_mutation_safe(service)
+    if state is not None:
+        state.assert_completion_unfenced(service)
     command = compose_args(service) + ["restart", "--no-deps", service.key]
     if dry_run:
         output("DRY RUN\n" + command_preview(command))
