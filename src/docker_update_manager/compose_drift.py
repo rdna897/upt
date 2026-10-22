@@ -44,6 +44,7 @@ REASONS = {
     "namespace_update_unresolved": "A namespace image update requires manual recovery before UPT can establish trust or mutate this service.",
     "bootstrap_unresolved": "Bootstrap verification was interrupted or failed. Manual recovery is required; automatic capture and mutation are fenced.",
     "namespace_apply_unresolved": "A namespace configuration Apply requires manual recovery before UPT can establish trust or mutate this service.",
+    "completion_unresolved": "An unresolved update or rollback completion requires manual recovery before UPT can mutate this service.",
     "namespace_apply_unqualified": "This Docker/Compose runtime is not qualified for namespace configuration Apply and recovery.",
     "namespace_env_file_unsupported": "Namespace configuration Apply does not support an env_file on the selected service.",
     "namespace_change_unqualified": "This configuration change is outside the namespace changes UPT has qualified for Apply (environment, labels, bounded command/entrypoint, restart policy, json-file logging, read-only bind).",

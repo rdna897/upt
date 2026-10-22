@@ -19,7 +19,7 @@ from sqlite_faults import select_from, sqlite_fault
 
 from docker_update_manager import cli, diskdiag, retention
 from docker_update_manager.retention import CleanupState, canonical_image_id, cleanup_blocker
-from docker_update_manager.state import State, CORE_SCHEMA_VERSION, LEGACY_SCHEMA
+from docker_update_manager.state import State, CORE_SCHEMA_VERSION, LEGACY_SCHEMA, SCHEMA9_VERSION
 from docker_update_manager.system import CommandError
 
 PROTECTED = "sha256:a1b2c3d4e5f6" + "0" * 52
@@ -905,14 +905,23 @@ class CleanupProtectionTests(unittest.TestCase):
                 self.assertIsNone(c.execute("SELECT 1 FROM sqlite_master WHERE name='schema_version'").fetchone())
         self.assertEqual(sorted(p.name for p in root.iterdir()), ["history.sqlite3"])
 
-    def test_ordinary_unversioned_legacy_migration_preserves_protection(self):
+    def test_unversioned_legacy_state_refused_unchanged_and_explicit_migration_preserves_protection(self):
+        # Schema 10 never converts existing state on open (G2-S0b); only the
+        # explicit offline path migrates, preserving NULL-history protection.
         root, path = self.legacy_database("legacy-migration")
-        state = State(root)
+        before = path.read_bytes()
+        for options in ({}, {"require_existing": True}):
+            with self.assertRaisesRegex(RuntimeError, "unversioned|not initialised"):
+                State(root, **options).ensure_compatible()
+        self.assertEqual(path.read_bytes(), before)
+        state = State(root, quiescent_transition=True)
         state.ensure_compatible()
         with state.read() as c:
-            self.assertEqual(c.execute("SELECT version FROM schema_version").fetchone()[0], CORE_SCHEMA_VERSION)
-            self.assertEqual(tuple(c.execute("SELECT image_id,reason FROM protected_images").fetchone()), (PROTECTED, "manual"))
-        State(root, require_existing=True).ensure_compatible()
+            self.assertEqual(c.execute("SELECT version FROM schema_version").fetchone()[0], SCHEMA9_VERSION)
+            self.assertEqual(tuple(c.execute("SELECT image_id,reason,history_id FROM protected_images").fetchone()),
+                             (PROTECTED, "manual", None))
+        with self.assertRaisesRegex(RuntimeError, "schema-10 transition"):
+            State(root, require_existing=True).ensure_compatible()
 
     def test_main_does_not_reach_retention_with_expired_abbreviated_ref(self):
         self.record(PROTECTED)  # active canonical ref

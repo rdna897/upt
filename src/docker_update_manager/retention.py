@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json, os, re, shutil, sqlite3
 from pathlib import Path
+from .completion_fence import BACKUP_CLAIM_ROOTS, CompletionFenceError, schema_matches, unresolved_claims
 from .diskdiag import du, parse_size
 from .progress import NULL_REPORTER
 from .system import run, CommandError
@@ -47,6 +48,61 @@ def canonical_image_id(value):
     return text if _IMAGE_ID.fullmatch(text) else None
 
 _REFUSED="refusing to remove images"
+_CLAIMED="UNRESOLVED RECOVERY CLAIM"
+_CLAIMS_UNVERIFIABLE="RECOVERY CLAIMS UNVERIFIABLE"
+
+class _Protection(frozenset):
+    """Protected image IDs; ``claimed`` are those held by unresolved G2 owners."""
+    def __new__(cls,values,claimed=frozenset()):
+        protection=super().__new__(cls,frozenset(values)|claimed); protection.claimed=frozenset(claimed); return protection
+
+def _image_claims(c):
+    """Unresolved G2 image claims; any failure raises and must refuse removal."""
+    return unresolved_claims(c)["image"]
+
+def _image_claim_blocker(state,image_id,c=None):
+    """Fresh G2 claim check; an unreadable claim set refuses, never permits."""
+    try:
+        if c is not None: claimed=image_id in _image_claims(c)
+        else:
+            with state.read() as fresh: claimed=image_id in _image_claims(fresh)
+    except (CompletionFenceError,sqlite3.Error): return "SKIPPED - "+_CLAIMS_UNVERIFIABLE
+    return "SKIPPED - "+_CLAIMED if claimed else None
+
+def _claimed_backups(state):
+    """Unresolved backup claims, or None when no state exists yet."""
+    if not state.db_path.exists(): return None
+    with state.read() as c: return unresolved_claims(c)["backup"]
+
+_UNREAD=object()
+
+def _backup_claim_blocker(state,path,expected=None,claims=_UNREAD):
+    """Why a managed artefact must be kept for an unresolved G2 claim, or None.
+
+    Claims name ``<managed root>/<entry>``. Filesystem identity is compared too,
+    so an alias through a symlinked root or entry cannot delete a claimed
+    object, and ``expected`` refuses an entry substituted since eligibility.
+    """
+    try: current=os.lstat(path)
+    except FileNotFoundError: current=None
+    except OSError: return _CLAIMS_UNVERIFIABLE
+    if expected is not None and (current is None or (current.st_dev,current.st_ino)!=expected):
+        return "ARTIFACT CHANGED"
+    if claims is _UNREAD:
+        try: claims=_claimed_backups(state)
+        except (CompletionFenceError,sqlite3.Error,OSError): claims=_CLAIMS_UNVERIFIABLE
+    if claims==_CLAIMS_UNVERIFIABLE: return _CLAIMS_UNVERIFIABLE
+    if not claims: return None
+    if f"{path.parent.name}/{path.name}" in claims: return _CLAIMED
+    if current is None: return None
+    identities=set()
+    for value in claims:
+        for probe in (os.lstat,os.stat):
+            try: info=probe(state.root/value)
+            except FileNotFoundError: continue
+            except OSError: return _CLAIMS_UNVERIFIABLE
+            identities.add((info.st_dev,info.st_ino))
+    return _CLAIMED if (current.st_dev,current.st_ino) in identities else None
 
 class CleanupState:
     """The verified state database for one dangling-image cleanup run.
@@ -92,7 +148,8 @@ class CleanupState:
         version=c.execute("SELECT version FROM schema_version").fetchall()
         identity=[tuple(row) for row in c.execute("SELECT singleton,identity FROM core_schema_identity")] \
             if c.execute("SELECT 1 FROM sqlite_master WHERE name='core_schema_identity'").fetchone() else []
-        if [tuple(row) for row in version]!=[(CORE_SCHEMA_VERSION,)] or identity!=[(1,CORE_SCHEMA_IDENTITY)]:
+        if ([tuple(row) for row in version]!=[(CORE_SCHEMA_VERSION,)] or identity!=[(1,CORE_SCHEMA_IDENTITY)]
+                or not schema_matches(c)):
             raise RuntimeError(f"UPT state database schema is not compatible with this cleanup; {_REFUSED}")
 
     def _require_identity(self):
@@ -113,7 +170,11 @@ class CleanupState:
         self._require_identity()
         if any(not isinstance(value,str) or canonical_image_id(value)!=value for value in recorded):
             raise RuntimeError(f"rollback protection contains a non-canonical image identity; {_REFUSED}")
-        return frozenset(values)
+        try: claimed=_image_claims(c)
+        except CompletionFenceError:
+            raise RuntimeError(f"G2 recovery claims are malformed; {_REFUSED}") from None
+        self._require_identity()
+        return _Protection(values,claimed)
 
     def protection(self):
         """Canonical IDs cleanup must keep, from one short read (no Docker inside)."""
@@ -136,6 +197,7 @@ class CleanupState:
 def cleanup_blocker(protection,image_id):
     """Why canonical ``image_id`` must not be removed, or None if eligible."""
     if canonical_image_id(image_id)!=image_id: return "INVALID IMAGE IDENTITY"
+    if image_id in getattr(protection,"claimed",()): return _CLAIMED
     return "ROLLBACK PROTECTED" if image_id in protection else None
 
 def _utc(value=None):
@@ -157,6 +219,8 @@ def _artifact_created(path): return datetime.fromtimestamp(path.stat().st_mtime,
 
 def inventory(cfg,state,now=None,image_details=False):
     now=_utc(now); settings=_settings(cfg); artifacts=[]
+    try: claims=_claimed_backups(state)
+    except (CompletionFenceError,sqlite3.Error,OSError): claims=_CLAIMS_UNVERIFIABLE
     for dirname in MANAGED_DIRS:
         root=state.root/dirname
         if dirname == "compose-recoveries":
@@ -167,7 +231,11 @@ def inventory(cfg,state,now=None,image_details=False):
         for path in root.iterdir():
             try:
                 created=_artifact_created(path); size=du(path) if path.is_dir() else path.stat().st_size
-                artifacts.append({"kind":dirname,"path":str(path),"created":created.isoformat(),"expires":expires(created,days).isoformat(),"expired":expired(created,days,now),"size":size})
+                item={"kind":dirname,"path":str(path),"created":created.isoformat(),"expires":expires(created,days).isoformat(),"expired":expired(created,days,now),"size":size}
+                if dirname in BACKUP_CLAIM_ROOTS and (reason:=_backup_claim_blocker(state,path,claims=claims)):
+                    # Kept past TTL while an unresolved G2 completion claims it.
+                    item.update(expired=False,protection="unverifiable" if reason==_CLAIMS_UNVERIFIABLE else "claimed")
+                artifacts.append(item)
             except OSError: pass
     logs=[]
     if cfg.log_dir.exists():
@@ -264,7 +332,8 @@ def _removal_blocker(state,image_id,*,check_active):
             return "SKIPPED - SHARED ACTIVE ROLLBACK"
         if c.execute(_UNRESOLVED_PROTECTION,(image_id,)).fetchone():
             return "SKIPPED - UNRESOLVED PROTECTION"
-    return None
+        # Independent of every rollback ref/protection, expired or overridden.
+        return _image_claim_blocker(state,image_id,c)
 
 def rollback_points(cfg,state,now=None,image_details=False):
     if not state.db_path.exists(): return []
@@ -367,9 +436,18 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
         # Refuse any path that is not a direct descendant of an explicitly managed root.
         allowed=[state.root/d for d in MANAGED_DIRS if d != "compose-recoveries"]+[cfg.log_dir]
         if not any(path.parent.resolve()==root.resolve() for root in allowed): result["skipped"].append({"path":str(path),"reason":"OUTSIDE MANAGED ROOT"}); continue
+        managed=item["kind"]!="operational-log"
+        try: eligible=os.lstat(path) if managed else None
+        except OSError: eligible=None
+        reason=_backup_claim_blocker(state,path) if managed else None
+        if reason: result["skipped"].append({"path":str(path),"reason":reason}); reporter.warning(reason,path.name); continue
         if dry_run: reporter.advance(index,task_total,path.name,"would purge"); continue
         is_directory=path.is_dir()
         if cleanup_state: cleanup_state.protection()
+        # Final boundary: claims and the exact filesystem object, rechecked
+        # outside any SQLite transaction.
+        if managed and eligible is not None and (reason:=_backup_claim_blocker(state,path,(eligible.st_dev,eligible.st_ino))):
+            result["skipped"].append({"path":str(path),"reason":reason}); reporter.warning(reason,path.name); continue
         try:
             if is_directory: shutil.rmtree(path)
             else: path.unlink()
@@ -427,6 +505,10 @@ def cleanup(cfg,state,*,dry_run=False,reporter=NULL_REPORTER,automatic=False,now
         # reason skips this image; raising stops the run and is not caught.
         if cleanup_state: reason=cleanup_blocker(cleanup_state.protection(),image_id)
         else: reason=revalidate(image_id) if revalidate else None
+        if not reason:
+            # Last check before Docker, in its own short read.
+            claim=_image_claim_blocker(state,image_id)
+            reason=claim[len("SKIPPED - "):] if claim else None
         if reason:
             reason="SKIPPED - "+reason; result["skipped"].append({"image":image_id,"reason":reason}); reporter.warning(reason,image_id[:19])
             reporter.advance(index,task_total,image_id[:19],"skipped"); continue

@@ -134,6 +134,9 @@ def generate_conversion(service,state,output: Path,*,dry_run=False,replace_files
         return compose_path,summary,raw
     if not yes and reporter.prompt(f"Write conversion files under {output}? [y/N] ",input_fn).strip().lower() not in {"y","yes"}:
         reporter.finish("Conversion cancelled"); print("Cancelled; no files or containers were changed."); return None
+    # Before any write: the target may be a fenced service's Compose source.
+    state.assert_completion_unfenced(service)
+    state.assert_sources_unfenced([compose_path])
     existing=[p for p in (compose_path,env_path) if p.exists()]
     if existing and not replace_files: raise ValueError("conversion files already exist; use --replace-files after reviewing them")
     if existing:
@@ -149,6 +152,8 @@ def generate_conversion(service,state,output: Path,*,dry_run=False,replace_files
 @reconcile_operation
 def deploy_conversion(service,state,output: Path,summary,raw,*,yes=False,reporter=NULL_REPORTER,input_fn=input,health_timeout=90):
     require_mutation_safe(service)
+    state.assert_completion_unfenced(service)
+    state.assert_sources_unfenced([output/"compose.yml"])
     if not yes and reporter.prompt(f"Adopt {service.name} into Compose? The original will be stopped but retained. [y/N] ",input_fn).strip().lower() not in {"y","yes"}:
         print("Cancelled; generated files were retained but the container was not changed."); return None
     require_mutation_safe(service)
@@ -210,6 +215,8 @@ def rollback_conversion(service_name,state,*,yes=False,reporter=NULL_REPORTER,in
     retained = resolve_service(discover(all_containers=True), backup)
     require_mutation_safe(current)
     require_mutation_safe(retained)
+    state.assert_completion_unfenced(current)
+    state.assert_completion_unfenced(retained)
     if not yes and reporter.prompt(f"Remove the Compose replacement and restore retained container {backup}? [y/N] ",input_fn).strip().lower() not in {"y","yes"}: print("Cancelled."); return
     reporter.start("convert-rollback",f"Restoring standalone container {service_name}")
     require_mutation_safe(current)

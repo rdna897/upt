@@ -90,6 +90,11 @@ def pin_target(service, digest=False, target_image=None):
     base=ref.original.rsplit(":",1)[0] if ":" in ref.original.rsplit("/",1)[-1] else ref.original
     return f"{base}:{service.version}"
 
+def pin_source(service):
+    """The one file a pin of ``service`` rewrites: its image source or the project .env."""
+    source, expression=locate_image_source(service)
+    return Path(service.working_dir)/".env" if re.search(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", expression) else source
+
 def pin_plan(service, digest=False, target_image=None):
     source, expression=locate_image_source(service)
     target=pin_target(service, digest, target_image)

@@ -424,7 +424,9 @@ class ServiceVerificationTests(unittest.TestCase):
             c.execute("DROP TABLE IF EXISTS core_schema_identity")
             c.execute("DROP TABLE IF EXISTS compose_bootstrap_fences")
             c.execute("UPDATE schema_version SET version=6")
-        upgraded = State(self.state.root)
+        with self.assertRaisesRegex(RuntimeError, "legacy schema 6"):
+            State(self.state.root).latest_scan()
+        upgraded = State(self.state.root, quiescent_transition=True)
         self.assertEqual(upgraded.latest_scan(), before)
         self.assertEqual(len(upgraded.history()), 1)
         self.assertEqual(upgraded.verification_snapshot()[0]["service_key"], "container/" + self.old.container_id)

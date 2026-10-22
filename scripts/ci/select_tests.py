@@ -60,6 +60,7 @@ COMPOSE_TESTS = (
     "test_compose_recovery_retention", "test_cleanup_protection", "test_conversion",
     "test_post_mutation_reconciliation", "test_same_project_baseline_reconciliation",
     "test_schema_compatibility_boundary", "test_state_rollback_compatibility",
+    "test_g2_completion_fences",
     "test_web_operations", "test_web_rollback", "test_core", "test_pin_history_image",
     "test_sqlite_completion_characterisation",
 )
@@ -77,6 +78,7 @@ CLI_TESTS = (
     "test_core", "test_discovery", "test_pin_history_image", "test_progress",
     "test_compose_namespace", "test_schema_compatibility_boundary",
     "test_version_contract", "test_disk_retention", "test_cleanup_protection",
+    "test_g2_completion_fences",
 )
 
 SRC = "src/docker_update_manager/"
@@ -104,6 +106,7 @@ RULES: tuple[tuple[str, Suite], ...] = (
     # Shared orchestration, state, security and recovery: always full.
     (SRC + "state.py", _full("persistent state and history")),
     (SRC + "state_transition.py", _full("persistent state transitions")),
+    (SRC + "completion_fence.py", _full("G2 recovery fences and claims")),
     (SRC + "sqlite_outcome.py", _full("persistent state transaction outcome primitives")),
     (SRC + "lock.py", _full("exclusive operation locking")),
     (SRC + "auth.py", _full("authentication")),

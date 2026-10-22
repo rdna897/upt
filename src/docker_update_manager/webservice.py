@@ -2757,6 +2757,11 @@ class ReadOnlyService:
         if fence:
             return result(UNVERIFIABLE, 'namespace_apply_unresolved' if self.state.namespace_apply_operation(
                 fence.get('operation_id')) else 'bootstrap_unresolved')
+        try:
+            self.state.assert_completion_unfenced(service)
+        except ValueError:
+            # Includes malformed G2 evidence: never a mutation authority.
+            return result(UNVERIFIABLE, 'completion_unresolved')
         replicas = [item for item in found
                     if item.stack == service.stack and item.compose_service == service.compose_service]
         runtime_hash = (service.labels or {}).get(COMPOSE_HASH_LABEL)

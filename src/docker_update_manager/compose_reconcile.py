@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .compose_namespace import require_mutation_safe
 from .compose import atomic_write_bytes, validate, verify_atomic_replace_access
+from .completion_fence import recovery_sources_unfenced
 from .compose_baseline import _read_private, _write_private
 from .compose_drift import fingerprint, read_input
 from .docker import compose_args
@@ -132,6 +133,7 @@ def do_compose_reconcile(service, state, plan, *, operation_id, binding,
     a guard the only recovery is the qualified completed-zero desired
     startup/health failure; every other post-marker failure is manual.
     """
+    state.assert_completion_unfenced(service)  # before any bundle, source or runtime effect
     command = compose_args(service, project_name=service.stack) + [
         "up", "-d", "--no-deps", "--pull", "never"] + (["--no-build"] if guard else []) + [service.compose_service]
     boundary = False
@@ -239,11 +241,15 @@ def do_compose_reconcile(service, state, plan, *, operation_id, binding,
         # Refuse the entire restore on an observed edit; repeat before every
         # atomic replacement so a later edit is never knowingly overwritten.
         check_sources()
+        # Recovery never overwrites a shared source another completion owns.
+        recovery_sources_unfenced(state, [path for path, item in target.items()
+                                          if item.content != expected_sources[path].content])
         for path, item in target.items():
             before = expected_sources[path]
             if item.content == before.content:
                 continue
             check_sources()
+            recovery_sources_unfenced(state, [path])
             check_recovery_runtime()
             verify_atomic_replace_access([path])
             atomic_write_bytes(path, item.content, expected=before.content)

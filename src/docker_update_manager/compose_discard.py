@@ -9,6 +9,7 @@ from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 from yaml.tokens import AliasToken, AnchorToken, DirectiveToken, TagToken
 
 from .compose import atomic_write_bytes, validate, verify_atomic_replace_access
+from .completion_fence import recovery_sources_unfenced
 from .compose_drift import InputFile, InputReadError, Inventory, fingerprint, read_input
 from .compose_reconcile import (RecoveryBundle, ReconcileOutcome, input_layout,
                                 runtime_identity, verify_image_unchanged)
@@ -261,6 +262,7 @@ def do_compose_discard(service, state, plan, *, operation_id, binding, revalidat
                        discover_current, verify_configuration, verify_context,
                        mutation_started=lambda: None, reporter=NULL_REPORTER, dry_run=False):
     """Caller holds the shared mutation lock; one source write and one recovery."""
+    state.assert_completion_unfenced(service)  # before any bundle, source or runtime effect
     boundary = False
     bundle = None
     mutation = plan.discard_plan
@@ -302,6 +304,7 @@ def do_compose_discard(service, state, plan, *, operation_id, binding, revalidat
         sources(pending_inventory)
         containers()
         verify_atomic_replace_access([mutation.pending.path])
+        state.assert_sources_unfenced([mutation.pending.path])  # a peer's fence may own this shared source
         if dry_run:
             return ReconcileOutcome("dry_run")
         stage(1, "Revalidate reviewed source isolation")
@@ -315,6 +318,7 @@ def do_compose_discard(service, state, plan, *, operation_id, binding, revalidat
         containers()
         bundle.verify()
         verify_atomic_replace_access([mutation.pending.path])
+        state.assert_sources_unfenced([mutation.pending.path])
         stage(3, "Discarding configuration changes", "running")
         mutation_started()
         atomic_write_bytes(mutation.pending.path, mutation.restored.content, expected=mutation.pending.content,
@@ -338,6 +342,7 @@ def do_compose_discard(service, state, plan, *, operation_id, binding, revalidat
             # are never overwritten, even when their effective model matches.
             sources(restored_inventory)
             verify_atomic_replace_access([mutation.pending.path])
+            recovery_sources_unfenced(state, [mutation.pending.path])
             atomic_write_bytes(mutation.pending.path, mutation.pending.content, expected=mutation.restored.content)
             sources(pending_inventory)
             validate(service, project_name=service.stack)

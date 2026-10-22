@@ -45,6 +45,7 @@ REASONS = {name: message for name, message in (
     ('review_changed', 'The reviewed source or runtime evidence changed.'),
     ('operation_active', 'Another UPT operation is active.'),
     ('bootstrap_unresolved', 'An unresolved bootstrap requires manual recovery before any further mutation.'),
+    ('completion_unresolved', 'An unresolved update or rollback completion requires manual recovery before any further mutation.'),
     ('evidence_unavailable', 'Private bootstrap evidence could not be safely persisted or verified.'),
 )}
 REASONS.update({key: COMPOSE_REASONS[key] for key in (
@@ -207,6 +208,10 @@ def make_plan(service, found, state, *, model_reader, hash_reader, context_reade
     key = logical_key(service.stack, service.compose_service, service.working_dir, service.compose_files)
     if state.bootstrap_fence(key, own_operation=own_operation):
         raise BootstrapRefused('bootstrap_unresolved')
+    try:
+        state.assert_completion_unfenced(service)
+    except ValueError:
+        raise BootstrapRefused('completion_unresolved') from None
     with state.read() as c:
         if c.execute("SELECT 1 FROM operation_runs WHERE status IN ('queued','running','finalizing') AND id!=?", (own_operation or '',)).fetchone():
             raise BootstrapRefused('operation_active')
@@ -371,6 +376,10 @@ def do_compose_bootstrap(plan, state, *, operation_id, requester, client_ip, use
     """
     require_mutation_safe(plan.service, model=plan.desired_model)
     state.ensure_compatible()
+    try:
+        state.assert_completion_unfenced(plan.service)
+    except ValueError:
+        raise BootstrapRefused('completion_unresolved') from None
     transcript = []
     require_compose_flags()
     service = plan.service

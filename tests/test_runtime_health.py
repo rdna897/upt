@@ -492,7 +492,7 @@ class RuntimePersistenceTests(unittest.TestCase):
         with self.state.read() as connection:
             raw = connection.execute("SELECT payload FROM runtime_snapshot").fetchone()[0]
             version = connection.execute("SELECT version FROM schema_version").fetchone()[0]
-        self.assertEqual(version, 9)
+        self.assertEqual(version, 10)
         for forbidden in ("environment", "labels", "mounts", "health_output", "State.Error"):
             self.assertNotIn(forbidden, raw)
 
