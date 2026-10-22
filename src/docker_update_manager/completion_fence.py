@@ -278,6 +278,20 @@ def _aliases(path):
     return {path, os.path.realpath(path)}
 
 
+def _owned(fence):
+    return set().union(*map(_aliases, (*fence.compose_files, os.path.join(fence.working_dir, ".env"))))
+
+
+def tree_refusal(fences, directories):
+    """Why recursively deleting ``directories`` would remove a fenced source, or None."""
+    roots = set().union(*map(_aliases, directories))
+    for fence in fences:
+        if any(source == root or source.startswith(root.rstrip(os.sep) + os.sep)
+               for source in _owned(fence) for root in roots):
+            return "completion_unresolved: an unresolved update/rollback completion requires manual recovery"
+    return None
+
+
 def source_refusal(fences, paths, *, stack=None, compose_service=None):
     """Why rewriting Compose ``paths`` would mutate a fenced service, or None.
 
@@ -286,8 +300,7 @@ def source_refusal(fences, paths, *, stack=None, compose_service=None):
     """
     sources = set().union(*map(_aliases, paths))
     for fence in fences:
-        owned = set().union(*map(_aliases, (*fence.compose_files, os.path.join(fence.working_dir, ".env"))))
-        if (sources & owned
+        if (sources & _owned(fence)
                 or (stack and compose_service and (fence.stack, fence.compose_service) == (stack, compose_service))):
             return "completion_unresolved: an unresolved update/rollback completion requires manual recovery"
     return None

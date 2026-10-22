@@ -87,13 +87,16 @@ Service admission protects the selected logical service. Independently, every pa
 
 | Writer | Before first write | Later boundary | Recovery write |
 | --- | --- | --- | --- |
-| `do_pin` (incl. `update --pin`) | actual pin target (image file or project `.env`); `update --pin` checks before backup/pull | — | recheck before restoring after failed validation |
+| `do_pin` (incl. `update --pin`) | actual pin target (image file or project `.env`); `update --pin` checks before backup/pull | — | after failed validation: fence recheck, then restore the exact original bytes only if the source still holds exactly the bytes the pin wrote (checked at the atomic replacement); otherwise keep source and backup, record `MANUAL RECOVERY REQUIRED` |
 | Pinned update (`_do_pinned_update`) | pin target, before backup | recheck after the pull, immediately before the write | recheck before restoring UPT's own pin; refusal records `MANUAL RECOVERY REQUIRED` |
 | CLI rollback (`do_rollback`) | every restored source, before any write | each source before its write | — |
 | Web rollback (`do_web_rollback`) | every restored source, before backup | each source before its write | each source in `restore_current_sources`; refusal is manual recovery |
 | Compose Apply recovery (`do_compose_reconcile`) | — (success writes no source) | — | changed sources before each `replace_sources` and per file |
 | Compose discard (`do_compose_discard`) | pending source, before bundle/dry run | recheck immediately before the write | recheck before restoring pending bytes |
 | `restore-compose`, conversion generate/deploy | unchanged (§5) | | |
+| `remove --purge-data` (deletion) | eligible config files (`source_refusal`) and bind trees containing any fenced Compose file or project `.env` (`tree_refusal`), marked `SKIP — UNRESOLVED RECOVERY FENCE` in the plan and dry run, re-proved after confirmation before the container is removed | fresh check immediately before each file/tree deletion | — |
+
+Fences are matched from validated evidence, so an absent service (no container) still owns its sources. A fence introduced after planning skips only the affected deletion; unrelated volumes, binds and files keep their existing eligibility. Malformed evidence present at the start refuses the removal before any effect (service admission); malformed or unreadable evidence discovered later keeps every remaining config file and bind tree (`RECOVERY FENCES UNVERIFIABLE`).
 
 No SQLite transaction spans these filesystem or Docker effects: each check is its own short read. A recovery recheck refuses on a proven conflict or malformed evidence; when the database itself is unreadable it keeps the pre-existing S0a compensation (the sources were proved unfenced before the first write and only the operation's own verified bytes are restored), preserving the characterised S0a outcome.
 
@@ -121,7 +124,8 @@ No production module inserts, updates or deletes G2 rows (enforced by a source-s
 5. `State.record` still uses `INSERT OR REPLACE` for `protected_images`; preserving `NULL history_id` rows on publication is S0c work. S0b does not modify any protection row.
 6. Core `do_restart` callers without a `State` (tests/internal) skip the G2 check; the CLI always supplies state.
 7. Sibling services sharing Compose sources are not blocked from service mutation, but any write to a fenced service's Compose file or project `.env` is refused (§5a). `env_file` and other referenced inputs are not part of evidence v1 and are not source-fenced.
-8. A recovery recheck that cannot read the database proceeds with the existing compensation (§5a) rather than abandoning it; forward source writes fail closed on the same condition.
+8. A recovery recheck that cannot read the database proceeds with the existing compensation (§5a) rather than abandoning it; forward source writes fail closed on the same condition. For `do_pin` the compensation additionally requires the exact written bytes at the replacement boundary.
+9. `remove --purge-data` skips, rather than aborts on, fenced deletions, consistent with its other safety skips; the container and unrelated resources are still removed.
 
 ## 9. Remaining risks
 

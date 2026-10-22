@@ -1272,5 +1272,252 @@ class ClaimOwnerEvidenceTests(Base):
         self.assertEqual(self.skipped(result)[IMAGE_A], "SKIPPED - UNRESOLVED RECOVERY CLAIM")
 
 
+
+class PinRecoveryTests(Base):
+    """``do_pin`` restores only over its own exact bytes, never over an edit or a fence."""
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.root / "media"
+        self.project.mkdir()
+        self.compose = self.project / "compose.yml"
+        self.compose.write_text(SHARED)
+        self.original = self.compose.read_bytes()
+        self.state = State(self.state_dir)
+        self.app = compose_service(self.root)
+        self.worker = compose_service(self.root, name="worker")
+        self.unavailable = False
+        self.validate = Mock(return_value=None)
+        real = self.state.completion_fences
+
+        def fences():
+            if self.unavailable:
+                raise sqlite3.OperationalError("unable to open database file")
+            return real()
+        for target, value in (("compose_namespace.mutation_refusal", Mock(return_value=None)),
+                              ("operations.validate", self.validate), ("operations.mark_changed", Mock()),
+                              ("operations.mark_project_inputs_changed", Mock())):
+            patcher = patch("docker_update_manager." + target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(self.state, "completion_fences", side_effect=fences)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def pin(self):
+        from docker_update_manager import operations
+        with contextlib.redirect_stdout(io.StringIO()):
+            return operations.do_pin(self.worker, self.state, yes=True, reporter=Reporter(enabled=False),
+                                     output=lambda *_: None, reconcile_discover=lambda: [])
+
+    def fail_validation(self, during=None):
+        def validate(*_args, **_kwargs):
+            self.pinned = self.compose.read_bytes()
+            if during:
+                during()
+            raise RuntimeError("compose config failed")
+        self.validate.side_effect = validate
+
+    def history(self):
+        return [(row["action"], row["result"], row["rollback_result"]) for row in self.state.history()]
+
+    def assert_manual(self, expected):
+        from docker_update_manager.operations import RecoveryRequired
+        with self.assertRaisesRegex(RecoveryRequired, "manual recovery"):
+            self.pin()
+        self.assertEqual(self.compose.read_bytes(), expected)  # never overwritten
+        self.assertEqual(len(list((self.state_dir / "backups").iterdir())), 1)  # recovery evidence retained
+
+    def test_successful_pin_is_unchanged(self):
+        backup = self.pin()
+        self.assertIn("example/worker:1.0.0", self.compose.read_text())
+        self.assertIn("example/app:latest", self.compose.read_text())
+        self.assertTrue(Path(backup).is_dir())
+        self.assertEqual(self.history(), [("pin", "SUCCESS", None)])
+
+    def test_validation_failure_restores_exact_original_over_own_bytes(self):
+        self.fail_validation()
+        with self.assertRaisesRegex(RuntimeError, "original configuration restored"):
+            self.pin()
+        self.assertEqual(self.compose.read_bytes(), self.original)
+        self.assertEqual(self.history(), [])
+
+    def test_operator_edit_during_validation_is_never_overwritten(self):
+        edit = b"services:\n  app:\n    image: example/app:operator\n"
+        self.fail_validation(lambda: self.compose.write_bytes(edit))
+        self.assert_manual(edit)
+        self.assertEqual(self.history(), [("pin", "FAILED", "MANUAL RECOVERY REQUIRED")])
+
+    def test_edit_after_the_recovery_recheck_is_caught_at_the_replacement(self):
+        from docker_update_manager import operations
+        edit = b"services:\n  app:\n    image: example/app:late\n"
+        real = operations.recovery_sources_unfenced
+
+        def late_edit(state, paths):
+            real(state, paths)
+            self.compose.write_bytes(edit)  # after any earlier read, before the replacement
+        self.fail_validation()
+        with patch("docker_update_manager.operations.recovery_sources_unfenced", side_effect=late_edit):
+            self.assert_manual(edit)
+
+    def test_unreadable_database_keeps_compensation_only_over_exact_own_bytes(self):
+        self.fail_validation(lambda: setattr(self, "unavailable", True))
+        with self.assertRaisesRegex(RuntimeError, "original configuration restored"):
+            self.pin()
+        self.assertEqual(self.compose.read_bytes(), self.original)
+        self.unavailable = False
+        edit = b"services: {}\n"
+
+        def unavailable_and_edited():
+            self.unavailable = True
+            self.compose.write_bytes(edit)
+        self.compose.write_bytes(self.original)
+        self.fail_validation(unavailable_and_edited)
+        from docker_update_manager.operations import RecoveryRequired
+        with self.assertRaisesRegex(RecoveryRequired, "manual recovery"):
+            self.pin()
+        self.assertEqual(self.compose.read_bytes(), edit)
+
+    def test_fence_introduced_during_validation_refuses_restoration(self):
+        self.fail_validation(lambda: insert_fence(self.state, OP_1, self.app, lifecycle="manual"))
+        from docker_update_manager.operations import RecoveryRequired
+        with self.assertRaisesRegex(RecoveryRequired, "manual recovery"):
+            self.pin()
+        self.assertEqual(self.compose.read_bytes(), self.pinned)
+        self.assertNotEqual(self.pinned, self.original)
+
+
+class PurgeDataFenceTests(Base):
+    """``remove --purge-data`` never deletes a source an unresolved completion owns.
+
+    ``worker`` is removed; the fenced ``app`` has no container and its
+    evidence names ``compose.yml`` (shared), ``overrides/app.yml`` and the
+    project ``.env``. Docker is a controlled double; files are temporary.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.root / "media"
+        (self.project / "overrides").mkdir(parents=True)
+        (self.project / "data").mkdir()
+        self.compose = self.project / "compose.yml"
+        self.compose.write_text("services:\n  worker:\n    image: example/worker:latest\n")
+        self.override = self.project / "overrides" / "app.yml"
+        self.override.write_text("services:\n  app:\n    image: example/app:latest\n")
+        self.env = self.project / ".env"
+        self.env.write_text("TZ=UTC\n")
+        (self.project / "data" / "db").write_text("x")
+        self.state = State(self.state_dir)
+        self.app = compose_service(self.root, files=[str(self.compose), str(self.override)])
+        self.worker = compose_service(self.root, name="worker", files=[str(self.compose)])
+        self.mounts = [{"Type": "bind", "Source": str(self.project / "data"), "Destination": "/data"},
+                       {"Type": "bind", "Source": str(self.project / "overrides"), "Destination": "/config"},
+                       {"Type": "volume", "Name": "worker-cache", "Destination": "/cache"}]
+        self.on_container_rm = None
+        self.calls = []
+        for target, value in (("removal.require_mutation_safe", Mock()), ("removal.mark_changed", Mock()),
+                              ("removal._safe_bind_source", Mock(return_value=(True, "exclusive root-filesystem bind"))),
+                              ("removal.run", self.docker)):
+            patcher = patch("docker_update_manager." + target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def docker(self, args, **_):
+        args = list(args)
+        self.calls.append(args)
+        if args[:2] == ["docker", "inspect"]:
+            return json.dumps([{"Mounts": self.mounts}])
+        if args[:3] == ["docker", "ps", "-aq"]:
+            return ""
+        if "config" in args and "--services" in args:
+            return "worker\n"
+        if args[:3] == ["docker", "volume", "rm"]:
+            return ""
+        if "rm" in args:
+            if self.on_container_rm:
+                self.on_container_rm()
+            return ""
+        raise AssertionError(f"unexpected Docker call: {args}")
+
+    def remove(self, service=None, **options):
+        from docker_update_manager import removal
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            result = removal.remove_service(service or self.worker, self.state, purge_data=True, yes=True,
+                                            reporter=Reporter(enabled=False), reconcile_discover=lambda: [],
+                                            **options)
+        self.output = out.getvalue()
+        return result
+
+    def fence(self, app=None, **options):
+        insert_fence(self.state, OP_1, app or self.app, lifecycle="manual", **options)
+
+    def assert_sources_kept(self, result, reason="UNRESOLVED RECOVERY FENCE"):
+        for path in (self.compose, self.env, self.override):
+            self.assertTrue(path.exists(), path)
+        skipped = dict(result["skipped"])
+        for path in (self.compose, self.env, self.project / "overrides"):
+            self.assertEqual(skipped.get(str(path)), reason, path)
+        self.assertNotIn(str(self.project), json.dumps([r for _p, r in result["skipped"]]))
+
+    def test_absent_fenced_siblings_compose_env_and_containing_bind_are_kept(self):
+        self.fence()
+        preview = self.remove(dry_run=True)
+        self.assertFalse(preview["removed"])
+        self.assertIn(f"Config {self.compose}: SKIP — UNRESOLVED RECOVERY FENCE", self.output)
+        self.assertIn(f"Bind   {self.project / 'overrides'}: SKIP — UNRESOLVED RECOVERY FENCE", self.output)
+        result = self.remove()
+        self.assert_sources_kept(result)
+        # Independent resources keep their existing behaviour.
+        self.assertFalse((self.project / "data").exists())
+        self.assertEqual(result["volumes_removed"], ["worker-cache"])
+        self.assertEqual(result["configs_removed"], [])
+
+    def test_symlinked_fence_evidence_protects_the_resolved_sources(self):
+        link = self.root / "media-link"
+        link.symlink_to(self.project, target_is_directory=True)
+        aliased = compose_service(self.root, working_dir=link,
+                                  files=[str(link / "compose.yml"), str(link / "overrides" / "app.yml")])
+        self.fence(aliased)
+        self.assert_sources_kept(self.remove())
+
+    def test_fence_introduced_after_planning_blocks_each_deletion(self):
+        self.on_container_rm = lambda: self.fence()
+        self.assert_sources_kept(self.remove())
+        self.assertFalse((self.project / "data").exists())
+
+    def test_malformed_or_unreadable_fences_after_planning_keep_sources(self):
+        self.on_container_rm = lambda: self.fence(evidence="{not json")
+        self.assert_sources_kept(self.remove(), "RECOVERY FENCES UNVERIFIABLE")
+        self.assertTrue((self.project / "data").exists())  # cannot prove it holds no fenced source
+
+    def test_unreadable_database_after_planning_keeps_sources(self):
+        def unavailable():
+            patcher = patch.object(self.state, "completion_fences",
+                                   side_effect=sqlite3.OperationalError("unable to open database file"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.on_container_rm = unavailable
+        with patch.object(self.state, "record"):
+            self.assert_sources_kept(self.remove(), "RECOVERY FENCES UNVERIFIABLE")
+
+    def test_malformed_evidence_before_planning_refuses_before_any_effect(self):
+        self.fence(evidence="{not json")
+        with self.assertRaises(CompletionFenceError):
+            self.remove()
+        self.assertEqual(self.calls, [])
+        for path in (self.compose, self.env, self.override, self.project / "data" / "db"):
+            self.assertTrue(path.exists())
+
+    def test_unfenced_and_independent_removal_keep_existing_behaviour(self):
+        other = compose_service(self.root, stack="tools", name="other")
+        insert_fence(self.state, OP_2, other)  # an unrelated project's fence
+        result = self.remove()
+        self.assertEqual(sorted(result["configs_removed"]), sorted([str(self.compose), str(self.env)]))
+        self.assertEqual(sorted(result["binds_removed"]), sorted([str(self.project / "data"),
+                                                                  str(self.project / "overrides")]))
+        self.assertEqual(result["skipped"], [])
+        self.assertFalse(self.compose.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

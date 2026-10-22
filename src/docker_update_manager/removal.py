@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json, os, shutil, sqlite3
 from pathlib import Path
-from .completion_fence import CompletionFenceError
+from .completion_fence import CompletionFenceError, source_refusal, tree_refusal
 from .compose_namespace import require_mutation_safe
 from .docker import compose_args, discover
 from .reconciliation import mark_changed, reconcile_operation
@@ -45,6 +45,20 @@ def _claim_status(state,image_id):
     """Fresh G2 claim read before an image decision; failure keeps the image."""
     try: return "UNRESOLVED RECOVERY CLAIM" if image_id in state.completion_claims()["image"] else None
     except (CompletionFenceError,sqlite3.Error): return "RECOVERY CLAIMS UNVERIFIABLE"
+
+def _fence_status(state,path,*,tree=False):
+    """Fresh G2 check before deleting ``path``; unverifiable evidence keeps it."""
+    try: fences=state.completion_fences()
+    except (CompletionFenceError,sqlite3.Error,RuntimeError,OSError): return "RECOVERY FENCES UNVERIFIABLE"
+    return "UNRESOLVED RECOVERY FENCE" if (tree_refusal if tree else source_refusal)(fences,[path]) else None
+
+def _fence_plan(state,plan):
+    """Skip config files and bind trees an unresolved completion owns, including absent services'."""
+    for key,tree in (("configs",False),("binds",True)):
+        for item in plan[key]:
+            if item["eligible"] and (reason:=_fence_status(state,item["path"],tree=tree)):
+                item["eligible"]=False; item["reason"]=reason
+    return plan
 
 def _overlap(a,b):
     try: a.relative_to(b); return True
@@ -139,7 +153,7 @@ def remove_service(s,state,*,images=False,purge_data=False,dry_run=False,yes=Fal
     remove_cmd=(compose_args(s)+["rm","--stop","--force",s.key]) if s.stack else ["docker","rm","--force",s.container_id]
     rollback_images=_service_rollback_images(state,s) if images else []
     candidates=list(dict.fromkeys([s.image_id,*rollback_images])) if images else []
-    plan=resource_plan(s) if purge_data else {"volumes":[],"binds":[],"configs":[],"shared_project_services":[]}
+    plan=_fence_plan(state,resource_plan(s)) if purge_data else {"volumes":[],"binds":[],"configs":[],"shared_project_services":[]}
     print(f"Remove: {s.stack+'/'+s.key if s.stack else s.name}\nContainer: {s.name}\nCurrent image: {s.image}\nRuntime type: {'Compose' if s.stack else 'standalone'}")
     if purge_data:
         print("\nWARNING: --purge-data permanently deletes eligible application data and configuration. No recovery backup is created.")
@@ -183,6 +197,7 @@ def remove_service(s,state,*,images=False,purge_data=False,dry_run=False,yes=Fal
             print("Cancelled; nothing removed."); return {"removed":False,"images_removed":[],"skipped":[]}
     require_mutation_safe(s)
     state.assert_completion_unfenced(s)
+    if purge_data: _fence_plan(state,plan)  # fresh preflight: skip, rather than partly delete, fenced sources
     with reporter.task("Removing service container",service=s.key):
         mark_changed()
         run(remove_cmd,cwd=s.working_dir if s.stack else None,timeout=600)
@@ -196,11 +211,13 @@ def remove_service(s,state,*,images=False,purge_data=False,dry_run=False,yes=Fal
         reporter.stage(3,total,"Delete exclusive named volumes",service=s.key)
         for item in plan["binds"]:
             if not item["eligible"]: skipped.append((item["path"],item["reason"])); continue
+            if reason:=_fence_status(state,item["path"],tree=True): skipped.append((item["path"],reason)); continue
             try: _delete_path(item["path"]); binds_removed.append(item["path"])
             except Exception as exc: skipped.append((item["path"],str(exc)))
         reporter.stage(4,total,"Delete safe exclusive bind paths",service=s.key)
         for item in plan["configs"]:
             if not item["eligible"]: skipped.append((item["path"],item["reason"])); continue
+            if reason:=_fence_status(state,item["path"]): skipped.append((item["path"],reason)); continue
             try:
                 if Path(item["path"]).exists(): _delete_path(item["path"])
                 configs_removed.append(item["path"])

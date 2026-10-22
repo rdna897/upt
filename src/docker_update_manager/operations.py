@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, re, time
+import json, locale, re, time
 from pathlib import Path
 from .compose import atomic_write, atomic_write_bytes, backup_files, pin_plan, pin_source, pin_target, diff, validate
 import sqlite3
@@ -51,6 +51,23 @@ def _assert_pin_source_unfenced(s,state):
     except Exception: paths=[*s.compose_files,Path(s.working_dir or ".")/".env"]  # unlocatable: protect every candidate
     state.assert_sources_unfenced(paths)
 
+def _restore_pin(s,state,path,original,written,backup,target):
+    """Restore the pre-pin bytes only over exactly the bytes this pin wrote.
+
+    The expected-content check runs at the atomic replacement. A fence
+    conflict, malformed evidence or any changed byte keeps the source and the
+    backup for manual recovery; an unreadable database alone keeps the S0a
+    compensation, which still requires the exact written bytes.
+    """
+    try:
+        recovery_sources_unfenced(state,[path])
+        atomic_write_bytes(path,original,expected=written)
+    except Exception:
+        try:
+            state.record(stack=s.stack,service=s.key,action="pin",old_image=s.image,old_image_id=s.image_id,old_digest=s.digest,old_version=s.version,new_image=target,backup=str(backup),result="FAILED",rollback_result="MANUAL RECOVERY REQUIRED",details={"error":"Compose validation failed","configuration_restored":False,"recovery_required":True})
+        except Exception: pass  # the retained backup remains the recovery evidence
+        raise RecoveryRequired("Compose validation failed and the pinned source changed or could not be safely restored; manual recovery is required") from None
+
 @reconcile_operation
 def do_pin(s,state,*,digest=False,dry_run=False,yes=False,input_fn=input,reporter=NULL_REPORTER,output=print):
     if not s.digest:
@@ -66,14 +83,14 @@ def do_pin(s,state,*,digest=False,dry_run=False,yes=False,input_fn=input,reporte
     state.assert_sources_unfenced([path])  # a sibling's fence may own this shared source
     with reporter.task("Back up configuration",service=s.key): backup=backup_files([path],state.root,s)
     reporter.stage(3,total,"Backup configuration",service=s.key)
+    original=path.read_bytes()
     mark_changed(s)
     mark_project_inputs_changed()
     atomic_write(path,new)
     try:
         with reporter.task("Validate Compose configuration",service=s.key): validate(s)
     except Exception:
-        recovery_sources_unfenced(state,[path])  # never restore over a source a fence now owns
-        atomic_write(path,old)
+        _restore_pin(s,state,path,original,new.encode(locale.getpreferredencoding(False)),backup,target)
         raise RuntimeError("Compose validation failed; original configuration restored") from None
     reporter.stage(4,total,"Compose validation",service=s.key)
     state.record(stack=s.stack,service=s.key,action="pin",old_image=s.image,old_image_id=s.image_id,old_digest=s.digest,old_version=s.version,new_image=target,backup=str(backup),result="SUCCESS")
