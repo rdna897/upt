@@ -81,6 +81,22 @@ Predicate: `State.assert_completion_unfenced(service)` (also called at the end o
 
 Dry-run update/pull previews remain read-only and do not consult fences, as for bootstrap fences.
 
+### 5a. Compose source-write boundaries
+
+Service admission protects the selected logical service. Independently, every path that rewrites a Compose source calls `State.assert_sources_unfenced(paths)` with the exact files it will write. A fence owns its Compose files and its project `.env`, compared lexically and through symlinks, so a sibling in the same project cannot rewrite them. Siblings remain operable when they write no fenced source (restart, ordinary update without `--pin`, Compose Apply, which writes no source on success).
+
+| Writer | Before first write | Later boundary | Recovery write |
+| --- | --- | --- | --- |
+| `do_pin` (incl. `update --pin`) | actual pin target (image file or project `.env`); `update --pin` checks before backup/pull | — | recheck before restoring after failed validation |
+| Pinned update (`_do_pinned_update`) | pin target, before backup | recheck after the pull, immediately before the write | recheck before restoring UPT's own pin; refusal records `MANUAL RECOVERY REQUIRED` |
+| CLI rollback (`do_rollback`) | every restored source, before any write | each source before its write | — |
+| Web rollback (`do_web_rollback`) | every restored source, before backup | each source before its write | each source in `restore_current_sources`; refusal is manual recovery |
+| Compose Apply recovery (`do_compose_reconcile`) | — (success writes no source) | — | changed sources before each `replace_sources` and per file |
+| Compose discard (`do_compose_discard`) | pending source, before bundle/dry run | recheck immediately before the write | recheck before restoring pending bytes |
+| `restore-compose`, conversion generate/deploy | unchanged (§5) | | |
+
+No SQLite transaction spans these filesystem or Docker effects: each check is its own short read. A recovery recheck refuses on a proven conflict or malformed evidence; when the database itself is unreadable it keeps the pre-existing S0a compensation (the sources were proved unfenced before the first write and only the operation's own verified bytes are restored), preserving the characterised S0a outcome.
+
 ## 6. Guarded deletion paths
 
 | Path | Eligibility | Final boundary |
@@ -90,7 +106,7 @@ Dry-run update/pull previews remain read-only and do not consult fences, as for 
 | `remove --images` | dry-run status | fresh claim read immediately before each `docker image rm` |
 | Backups (`backups`, `conversion-file-backups`, `conversion-snapshots`, `restore-bundles`) under TTL and forced retention | inventory marks claimed artefacts `protection: claimed` (or `unverifiable`) and not expired | claim name **and** filesystem identity (lstat/stat of every claimed path, defeating symlinked-root aliases) plus an unchanged-inode check against substitution, rechecked outside SQLite immediately before deletion |
 
-An unreadable or malformed claim set keeps the affected images/backups (`RECOVERY CLAIMS UNVERIFIABLE`); it is never an empty protection set. No SQLite transaction spans Docker or filesystem effects. `compose-recoveries`, R10 and PR #19 semantics are unchanged; unclaimed resources keep existing expiry. Metadata pruning never touches G2 rows (unresolved rows are also trigger-protected).
+Claim owners are trusted only after the same full validation as admission (`unresolved_fences`: owner, lifecycle, action, logical key, stack/Compose service, evidence format/version and logical-key reproducibility), read in the same transaction as the claims; claim kind/value and owner relationship are then checked. Any invalid unresolved fence refuses the whole claim set. An unreadable or malformed claim set keeps the affected images/backups (`RECOVERY CLAIMS UNVERIFIABLE`); it is never an empty protection set. No SQLite transaction spans Docker or filesystem effects. `compose-recoveries`, R10 and PR #19 semantics are unchanged; unclaimed resources keep existing expiry. Metadata pruning never touches G2 rows (unresolved rows are also trigger-protected).
 
 ## 7. Inert boundary and deferred work
 
@@ -99,11 +115,13 @@ No production module inserts, updates or deletes G2 rows (enforced by a source-s
 ## 8. Fail-closed decisions for author review
 
 1. Legacy (<8) and unversioned databases are no longer silently migrated by a normal open; this changes the earlier `test_ordinary_unversioned_legacy_migration_preserves_protection` expectation to refusal plus an explicit (transition-instance) migration that still preserves protection. No operator action migrates pre-8 state with this binary.
-2. Admission identity rule in §5; siblings in the same project that share a Compose file are **not** blocked (per-service design), while `restore-compose` is blocked by file overlap because it rewrites whole sources. Whether sibling source edits should also be fenced (they can invalidate a future source-digest proof) is an S0c/S1 decision.
+2. Admission identity rule in §5; siblings in the same project that share a Compose file are **not** blocked from service mutation (per-service design), but every write to a fenced service's Compose source is refused (§5a).
 3. Any malformed unresolved fence or claim refuses all admissions/deletions (global blast radius by design).
 4. Evidence v1 is minimal; `action` admits `web_rollback`; claims may be added to `manual` owners.
 5. `State.record` still uses `INSERT OR REPLACE` for `protected_images`; preserving `NULL history_id` rows on publication is S0c work. S0b does not modify any protection row.
 6. Core `do_restart` callers without a `State` (tests/internal) skip the G2 check; the CLI always supplies state.
+7. Sibling services sharing Compose sources are not blocked from service mutation, but any write to a fenced service's Compose file or project `.env` is refused (§5a). `env_file` and other referenced inputs are not part of evidence v1 and are not source-fenced.
+8. A recovery recheck that cannot read the database proceeds with the existing compensation (§5a) rather than abandoning it; forward source writes fail closed on the same condition.
 
 ## 9. Remaining risks
 

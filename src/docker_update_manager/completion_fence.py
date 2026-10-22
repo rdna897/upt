@@ -203,14 +203,20 @@ def valid_claim(kind, value):
 
 
 def unresolved_claims(c):
-    """Claims of unresolved owners by kind; orphaned or malformed claims refuse."""
+    """Claims of unresolved owners by kind; orphaned or malformed claims refuse.
+
+    An owner is trusted only after the full fence validation used for
+    admission, so retention never relies on evidence admission would refuse.
+    ``c`` must hold one read transaction so owners and claims are consistent.
+    """
+    owners = {fence.operation_id for fence in unresolved_fences(c)}
     claims = {kind: set() for kind in CLAIM_KINDS}
     rows = c.execute(
         "SELECT cl.operation_id,cl.kind,cl.value,f.lifecycle FROM completion_fence_claims cl "
         "LEFT JOIN completion_fences f ON f.operation_id=cl.operation_id "
         "WHERE f.lifecycle IS NOT 'resolved'").fetchall()
     for operation_id, kind, value, lifecycle in (tuple(row) for row in rows):
-        if not (isinstance(operation_id, str) and _OPERATION_ID.fullmatch(operation_id)) or lifecycle not in UNRESOLVED:
+        if operation_id not in owners or lifecycle not in UNRESOLVED:
             raise _invalid("claim owner")
         if not valid_claim(kind, value):
             raise _invalid("claim")
@@ -253,11 +259,35 @@ def service_refusal(fences, service):
     return None
 
 
+def recovery_sources_unfenced(state, paths):
+    """Recheck before recovery restores sources an operation wrote.
+
+    A proven conflict or malformed evidence refuses (manual recovery). An
+    unreadable database keeps the existing compensation: these sources were
+    proved unfenced before the operation's first write and recovery restores
+    only bytes it verifies as its own.
+    """
+    try:
+        state.assert_sources_unfenced(paths)
+    except sqlite3.Error:
+        pass
+
+
+def _aliases(path):
+    path = os.path.abspath(str(path))
+    return {path, os.path.realpath(path)}
+
+
 def source_refusal(fences, paths, *, stack=None, compose_service=None):
-    """Why rewriting Compose ``paths`` would mutate a fenced service, or None."""
-    sources = {os.path.abspath(str(item)) for item in paths}
+    """Why rewriting Compose ``paths`` would mutate a fenced service, or None.
+
+    A fence owns its Compose files and its project ``.env`` (interpolation
+    input), compared lexically and through symlinks, whichever service writes.
+    """
+    sources = set().union(*map(_aliases, paths))
     for fence in fences:
-        if (sources.intersection(fence.compose_files)
+        owned = set().union(*map(_aliases, (*fence.compose_files, os.path.join(fence.working_dir, ".env"))))
+        if (sources & owned
                 or (stack and compose_service and (fence.stack, fence.compose_service) == (stack, compose_service))):
             return "completion_unresolved: an unresolved update/rollback completion requires manual recovery"
     return None

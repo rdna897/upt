@@ -1,7 +1,9 @@
 from __future__ import annotations
 import json, re, time
 from pathlib import Path
-from .compose import atomic_write, atomic_write_bytes, backup_files, pin_plan, pin_target, diff, validate
+from .compose import atomic_write, atomic_write_bytes, backup_files, pin_plan, pin_source, pin_target, diff, validate
+import sqlite3
+from .completion_fence import CompletionFenceError, recovery_sources_unfenced
 from .compose_namespace import require_mutation_safe
 from .docker import compose_args, discover
 from .registry import LOCAL_DIGEST_UNVERIFIED, remote_manifest, tracking_image
@@ -44,6 +46,11 @@ class WebRollbackFailure(RuntimeError):
 
 def command_preview(args): return "  " + " ".join(repr(x) if any(c.isspace() for c in x) else x for x in args)
 
+def _assert_pin_source_unfenced(s,state):
+    try: paths=[pin_source(s)]
+    except Exception: paths=[*s.compose_files,Path(s.working_dir or ".")/".env"]  # unlocatable: protect every candidate
+    state.assert_sources_unfenced(paths)
+
 @reconcile_operation
 def do_pin(s,state,*,digest=False,dry_run=False,yes=False,input_fn=input,reporter=NULL_REPORTER,output=print):
     if not s.digest:
@@ -56,6 +63,7 @@ def do_pin(s,state,*,digest=False,dry_run=False,yes=False,input_fn=input,reporte
     if not yes and reporter.prompt("Apply? [y/N] ",input_fn).strip().lower() not in {"y","yes"}: output("Cancelled."); return None
     state.ensure_compatible()
     state.assert_service_unfenced(s)  # refuse an unsupported state database before any side effect
+    state.assert_sources_unfenced([path])  # a sibling's fence may own this shared source
     with reporter.task("Back up configuration",service=s.key): backup=backup_files([path],state.root,s)
     reporter.stage(3,total,"Backup configuration",service=s.key)
     mark_changed(s)
@@ -64,6 +72,7 @@ def do_pin(s,state,*,digest=False,dry_run=False,yes=False,input_fn=input,reporte
     try:
         with reporter.task("Validate Compose configuration",service=s.key): validate(s)
     except Exception:
+        recovery_sources_unfenced(state,[path])  # never restore over a source a fence now owns
         atomic_write(path,old)
         raise RuntimeError("Compose validation failed; original configuration restored") from None
     reporter.stage(4,total,"Compose validation",service=s.key)
@@ -112,6 +121,7 @@ def _do_pinned_update(s,state,*,dry_run=False,yes=False,no_health=False,health_t
     state.ensure_compatible()
     state.assert_service_unfenced(s)  # refuse an unsupported state database before any side effect
     mutation_check()
+    state.assert_sources_unfenced([path])  # a sibling's fence may own this shared source
     if pre_source_write_check: pre_source_write_check(path)
     sources=list(s.compose_files); env=Path(s.working_dir)/".env"
     if env.exists(): sources.append(str(env))
@@ -127,6 +137,7 @@ def _do_pinned_update(s,state,*,dry_run=False,yes=False,no_health=False,health_t
         if target_guard: target_guard("pulled", target)
         reporter.stage(4,UPDATE_STAGE_TOTAL,"Pull exact replacement digest",service=s.key)
         if pre_recreate_check: pre_recreate_check()
+        state.assert_sources_unfenced([path])  # recheck after the pull, immediately before the write
         mark_changed()
         mark_project_inputs_changed()
         atomic_write(path,new)
@@ -172,6 +183,8 @@ def _do_pinned_update(s,state,*,dry_run=False,yes=False,no_health=False,health_t
                 # to restore our own pin. The source is recoverable only if it
                 # still contains exactly the bytes UPT wrote.
                 if path.read_text()!=new: raise RuntimeError("Compose source changed after UPT wrote the digest pin")
+                # Another completion may now own this source: keep it for manual recovery.
+                recovery_sources_unfenced(state,[path])
                 atomic_write(path,old); validate(s,project_name=project_name)
                 restored=True
                 if recreate_started:
@@ -185,7 +198,7 @@ def _do_pinned_update(s,state,*,dry_run=False,yes=False,no_health=False,health_t
                     recovery_started=True
                     run(up,cwd=s.working_dir,timeout=600)
                     recovery_recreated=True
-            except RecoveryRefused:
+            except (RecoveryRefused,CompletionFenceError):
                 recovery_refused=True
             except Exception:
                 # With the web guard installed, any failure before the
@@ -273,6 +286,7 @@ def do_update(s,state,*,dry_run=False,yes=False,no_health=False,pin=False,health
     if not yes and reporter.prompt(f"Update {s.key}? [y/N] ",input_fn).strip().lower() not in {"y","yes"}: output("Cancelled."); return
     state.ensure_compatible()
     state.assert_service_unfenced(s)  # refuse an unsupported state database before any side effect
+    if pin: _assert_pin_source_unfenced(s,state)  # before the pull and recreation, not only at the final pin
     if namespace_update: namespace_update.check()
     else: require_mutation_safe(s)
     backup_sources=list(s.compose_files)
@@ -405,8 +419,10 @@ def do_rollback(s,state,*,dry_run=False,yes=False,input_fn=input,reporter=NULL_R
     # Compose must reference the old image. Restore exact backed-up sources first.
     reporter.stage(1,7,"Locate rollback point",service=s.key)
     meta=Path(row["backup"])/"metadata.json"; data=json.loads(meta.read_text())
+    state.assert_sources_unfenced([item["source"] for item in data["files"]])  # every restored source, before any write
     current=[]
     for item in data["files"]:
+        state.assert_sources_unfenced([item["source"]])
         mark_changed()
         mark_project_inputs_changed()
         p=Path(item["source"]); current.append(p); atomic_write(p,Path(item["backup"]).read_text())
@@ -455,6 +471,7 @@ def do_web_rollback(s, row, state, *, sources, operation_id, rollback_command,
         if (not isinstance(item,dict) or not isinstance(item.get("path"),str)
                 or not isinstance(item.get("before"),bytes) or not isinstance(item.get("restore"),bytes)):
             raise ValueError("rollback source inventory could not be verified")
+    state.assert_sources_unfenced([item["path"] for item in sources])  # every restored source, before any effect
 
     total=8; recovery_backup=None; restored=[]; rollback_recreate_started=False; running_stage=None
     target_tag_attempted=False; automatically_recovered=False; manual_required=False
@@ -484,6 +501,7 @@ def do_web_rollback(s, row, state, *, sources, operation_id, rollback_command,
             verify_recovery_sources(recovery_backup)
             if path.is_symlink() or not path.is_file() or path.read_bytes()!=item["restore"]:
                 raise RuntimeError("a Compose source changed during rollback; automatic recovery was refused")
+            recovery_sources_unfenced(state,[path])  # refusal leaves the source for manual recovery
             atomic_write_bytes(path,item["before"])
             restored.remove(item)
         validate(s,project_name=s.stack)
@@ -533,6 +551,8 @@ def do_web_rollback(s, row, state, *, sources, operation_id, rollback_command,
             path=Path(item["path"])
             if path.is_symlink() or not path.is_file() or path.read_bytes()!=item["before"]:
                 raise RuntimeError("a Compose source changed before rollback; no source was overwritten")
+            try: state.assert_sources_unfenced([path])
+            except sqlite3.Error: raise RuntimeError("G2 recovery fence state could not be read") from None
             mark_changed()
             mark_project_inputs_changed()
             atomic_write_bytes(path,item["restore"])

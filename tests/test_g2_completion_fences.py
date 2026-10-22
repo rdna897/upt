@@ -29,6 +29,9 @@ from docker_update_manager.progress import Reporter
 from docker_update_manager.state import CORE_SCHEMA_VERSION, State
 from docker_update_manager.state_transition import refuse_schema10_downgrade, transition, upgrade_schema10
 from docker_update_manager.webstate import WEB_SCHEMA_VERSION, WebState
+import test_compose_apply as apply_fixtures
+import test_compose_discard as discard_fixtures
+from test_compose_reconciliation import ComposeFixture
 
 FIXTURES = Path(__file__).parent / "fixtures"
 sys.path.insert(0, str(FIXTURES))
@@ -853,6 +856,420 @@ class DeletionTests(Base):
         self.assertEqual(self.docker.removed, [IMAGE_A])
         self.assertFalse(stale.exists())
         self.assertEqual(result["skipped"], [])
+
+
+
+SHARED = "services:\n  app:\n    image: example/app:latest\n  worker:\n    image: example/worker:latest\n"
+WORKER_PINNED = "example/worker@sha256:" + "d" * 64
+WORKER_TARGET = "example/worker@sha256:" + "e" * 64
+
+
+class SharedSourceTests(Base):
+    """A sibling's operation never rewrites a Compose source a fenced service owns.
+
+    ``app`` and ``worker`` share ``compose.yml`` and the project ``.env``;
+    ``app`` holds the unresolved fence. Docker and Compose validation are
+    controlled doubles; every file is temporary.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.project = self.root / "media"
+        self.project.mkdir()
+        self.compose = self.project / "compose.yml"
+        self.compose.write_text(SHARED)
+        self.env = self.project / ".env"
+        self.env.write_text("WORKER_IMAGE=example/worker:latest\n")
+        self.state = State(self.state_dir)
+        self.app = compose_service(self.root)
+        self.worker = compose_service(self.root, name="worker")
+        self.quiet = Reporter(enabled=False)
+        self.docker = Mock(return_value="")
+        for target, value in (("compose_namespace.mutation_refusal", None), ("operations.validate", None),
+                              ("operations.mark_changed", None), ("operations.mark_project_inputs_changed", None)):
+            patcher = patch("docker_update_manager." + target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for target in ("operations.run", "operations.run_compose_progress"):
+            patcher = patch("docker_update_manager." + target, self.docker)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch("docker_update_manager.operations.discover", return_value=[self.worker])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fence(self):
+        if not self.state.completion_fences():
+            insert_fence(self.state, OP_1, self.app, lifecycle="manual")
+
+    def snapshot(self):
+        return self.compose.read_bytes(), self.env.read_bytes()
+
+    def history(self):
+        return [(row["service"], row["action"], row["result"], row["rollback_result"]) for row in self.state.history()]
+
+    @contextlib.contextmanager
+    def refused(self, history=()):
+        before = self.snapshot()
+        with self.assertRaises(CompletionFenceError) as refused, contextlib.redirect_stdout(io.StringIO()):
+            yield
+        self.assertIn("completion_unresolved", str(refused.exception))
+        self.assertNotIn(str(self.project), str(refused.exception))
+        self.assertEqual(self.snapshot(), before)
+        self.docker.assert_not_called()
+        self.assertFalse((self.state_dir / "backups").exists())
+        self.assertEqual(self.history(), list(history))
+
+    def test_sibling_pin_cannot_rewrite_shared_compose_or_project_env(self):
+        from docker_update_manager import operations
+        self.fence()
+        with self.refused():
+            operations.do_pin(self.worker, self.state, yes=True, reporter=self.quiet, output=lambda *_: None)
+        # A pin controlled through the shared project .env from a separate file.
+        separate = self.project / "worker.yml"
+        separate.write_text("services:\n  worker:\n    image: ${WORKER_IMAGE}\n")
+        worker = compose_service(self.root, name="worker", files=[str(separate)])
+        with self.refused():
+            operations.do_pin(worker, self.state, yes=True, reporter=self.quiet, output=lambda *_: None)
+        self.assertEqual(separate.read_text(), "services:\n  worker:\n    image: ${WORKER_IMAGE}\n")
+
+    def test_sibling_update_that_pins_or_advances_a_pin_is_refused_before_any_effect(self):
+        from docker_update_manager import operations
+        self.fence()
+        registry = Mock(side_effect=AssertionError("registry must not be consulted"))
+        with patch("docker_update_manager.operations.remote_manifest", registry), self.refused():
+            operations.do_update(self.worker, self.state, yes=True, pin=True, reporter=self.quiet,
+                                 output=lambda *_: None)
+        pinned = compose_service(self.root, name="worker", image=WORKER_PINNED)
+        self.compose.write_text(SHARED.replace("example/worker:latest", WORKER_PINNED))
+        with patch("docker_update_manager.operations.tracking_image", return_value="example/worker:latest"), \
+                patch("docker_update_manager.operations.remote_manifest",
+                      return_value={"digest": "sha256:" + "e" * 64, "platforms": []}), self.refused():
+            operations.do_update(pinned, self.state, yes=True, reporter=self.quiet, output=lambda *_: None)
+
+    def pinned_update(self, docker):
+        from docker_update_manager import operations
+        pinned = compose_service(self.root, name="worker", image=WORKER_PINNED)
+        self.compose.write_text(SHARED.replace("example/worker:latest", WORKER_PINNED))
+        fresh = compose_service(self.root, name="worker", image=WORKER_TARGET, image_id=IMAGE_B)
+        self.docker.side_effect = docker
+        with patch("docker_update_manager.operations.tracking_image", return_value="example/worker:latest"), \
+                patch("docker_update_manager.operations.remote_manifest",
+                      return_value={"digest": "sha256:" + "e" * 64, "platforms": []}), \
+                patch("docker_update_manager.operations.discover", return_value=[fresh]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return operations.do_update(pinned, self.state, yes=True, no_health=True, reporter=self.quiet,
+                                        output=lambda *_: None, reconcile_discover=lambda: [])
+
+    def test_fence_appearing_during_the_pull_blocks_the_later_source_write(self):
+        original = SHARED.replace("example/worker:latest", WORKER_PINNED)
+
+        def docker(args, **_):
+            if args[:2] == ["docker", "pull"]:
+                self.fence()
+            return ""
+        with self.assertRaisesRegex(RuntimeError, "completion_unresolved"):
+            self.pinned_update(docker)
+        self.assertEqual(self.compose.read_text(), original)
+        self.assertFalse(any("up" in call.args[0] for call in self.docker.call_args_list))
+        self.assertEqual(self.history(), [("worker", "update", "FAILED", None)])
+
+    def test_pinned_update_recovery_never_restores_over_a_fenced_source(self):
+        def docker(args, **_):
+            if "up" in args:
+                self.fence()
+                raise RuntimeError("recreation failed")
+            return ""
+        from docker_update_manager.operations import RecoveryRequired
+        with self.assertRaises(RecoveryRequired):
+            self.pinned_update(docker)
+        self.assertIn("sha256:" + "e" * 64, self.compose.read_text())  # left for manual recovery, not overwritten
+        self.assertEqual(sum("up" in call.args[0] for call in self.docker.call_args_list), 1)
+        self.assertEqual(self.history(), [("worker", "update", "FAILED", "MANUAL RECOVERY REQUIRED")])
+
+    def seed_rollback_point(self):
+        backup = self.state_dir / "backups" / "worker-seed"
+        backup.mkdir(parents=True)
+        (backup / "compose.yml").write_text(SHARED.replace("worker:latest", "worker:0.9"))
+        (backup / "worker.override.yml").write_text("services: {}\n")
+        self.override = self.project / "worker.override.yml"
+        self.override.write_text("services:\n  worker:\n    init: true\n")
+        # The worker-only file comes first: no source may be written before every one is proved.
+        (backup / "metadata.json").write_text(json.dumps({"stack": "media", "service": "worker", "files": [
+            {"source": str(self.override), "backup": str(backup / "worker.override.yml")},
+            {"source": str(self.compose), "backup": str(backup / "compose.yml")}]}))
+        self.state.record(stack="media", service="worker", action="update", old_image="example/worker:0.9",
+                          old_image_id=IMAGE_A, new_image="example/worker:latest", new_image_id=IMAGE_C,
+                          backup=str(backup), result="SUCCESS")
+        return backup
+
+    def test_cli_rollback_cannot_restore_a_fenced_shared_source(self):
+        from docker_update_manager import operations
+        self.seed_rollback_point()
+        self.fence()
+        before = self.snapshot()
+        with self.assertRaisesRegex(CompletionFenceError, "completion_unresolved"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            operations.do_rollback(self.worker, self.state, yes=True, reporter=self.quiet,
+                                   reconcile_discover=lambda: [])
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.override.read_text(), "services:\n  worker:\n    init: true\n")
+        self.docker.assert_not_called()
+        self.assertEqual(self.history(), [("worker", "update", "SUCCESS", None)])
+
+    def web_rollback(self, **verify):
+        from docker_update_manager import operations
+        from docker_update_manager.compose import compose_args
+        command = compose_args(self.worker, project_name="media") + ["up", "-d", "--no-deps", "--pull", "never",
+                                                                     "worker"]
+        sources = [{"path": str(self.compose), "before": self.compose.read_bytes(), "restore": b"services: {}\n"}]
+        callbacks = {name: verify.get(name, Mock()) for name in (
+            "verify_before_restore", "verify_before_recreate", "verify_recovery_sources",
+            "verify_pre_rollback_recovery")}
+        row = {"id": 1, "old_image_id": IMAGE_A, "old_image": "example/worker:0.9"}
+        return operations.do_web_rollback(self.worker, row, self.state, sources=sources, operation_id=OP_2,
+                                          rollback_command=command, recovery_command=command,
+                                          reconcile_discover=lambda: [], **callbacks)
+
+    def test_web_rollback_cannot_restore_a_fenced_shared_source(self):
+        self.fence()
+        verify = Mock()
+        with self.refused():
+            self.web_rollback(verify_before_restore=verify)
+        verify.assert_not_called()
+
+    def test_web_rollback_rechecks_each_source_write(self):
+        from docker_update_manager.operations import WebRollbackFailure
+        before = self.snapshot()
+
+        def verify(phase):
+            if phase == "source-write":
+                self.fence()
+        with self.assertRaises(WebRollbackFailure) as failed:
+            self.web_rollback(verify_before_restore=verify)
+        self.assertFalse(failed.exception.manual_recovery_required)
+        self.assertEqual(self.snapshot(), before)
+        self.docker.assert_not_called()
+        self.assertEqual(self.history(), [("worker", "rollback", "FAILED", "NO CHANGES MADE")])
+
+    def test_web_rollback_recovery_never_restores_over_a_fenced_source(self):
+        from docker_update_manager.operations import WebRollbackFailure
+        identities = {"example/worker:0.9": IMAGE_A, "example/worker:latest": IMAGE_C}
+
+        def docker(args, **_):
+            if args[:3] == ["docker", "image", "inspect"]:
+                return identities[args[-1]]
+            if "up" in args:
+                self.fence()
+                raise RuntimeError("recreation failed")
+            return ""
+        self.docker.side_effect = docker
+        with self.assertRaises(WebRollbackFailure) as failed, \
+                patch("docker_update_manager.operations.discover", return_value=[self.worker]):
+            self.web_rollback()
+        self.assertTrue(failed.exception.manual_recovery_required)
+        self.assertEqual(self.compose.read_bytes(), b"services: {}\n")  # not silently reverted
+        self.assertEqual(sum("up" in call.args[0] for call in self.docker.call_args_list), 1)
+        self.assertEqual(self.history(), [("worker", "rollback", "FAILED", "MANUAL RECOVERY REQUIRED")])
+
+    def test_independent_service_and_non_writing_sibling_operations_keep_behaviour(self):
+        from docker_update_manager import operations
+        self.fence()
+        other = compose_service(self.root, stack="tools", name="other")
+        Path(other.working_dir).mkdir()
+        Path(other.compose_files[0]).write_text("services:\n  other:\n    image: example/other:latest\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            operations.do_pin(other, self.state, yes=True, reporter=self.quiet, output=lambda *_: None)
+        self.assertIn("example/other:1.0.0", Path(other.compose_files[0]).read_text())
+        self.assertEqual(self.history(), [("other", "pin", "SUCCESS", None)])
+        # A sibling restart and ordinary (non-pinning) update write no source.
+        operations.do_restart(self.worker, state=self.state, reconcile_discover=lambda: [])
+        self.assertTrue(any("restart" in call.args[0] for call in self.docker.call_args_list))
+        probe = Mock(side_effect=RuntimeError("registry reached"))
+        with patch("docker_update_manager.operations.remote_manifest", probe), \
+                self.assertRaisesRegex(RuntimeError, "registry reached"), contextlib.redirect_stdout(io.StringIO()):
+            operations.do_update(self.worker, self.state, yes=True, reporter=self.quiet, output=lambda *_: None)
+        self.assertEqual(self.compose.read_text(), SHARED)
+
+
+class SharedSourceComposeTests(ComposeFixture):
+    """Compose discard and Apply recovery honour a fenced peer's shared source."""
+
+    start = apply_fixtures.ComposeApplyTests.start
+    execute = apply_fixtures.ComposeApplyTests.execute
+
+    def setUp(self):
+        super().setUp()
+        self.compose.write_bytes(discard_fixtures.SIMPLE)
+        self.service = self.make_service(self.current_hash())
+        self.runtime = [self.service]
+        self.fake = apply_fixtures.FakeApplyCompose(self)
+        for module in ("webservice", "compose_reconcile", "compose"):
+            patch(f"docker_update_manager.{module}.run", side_effect=self.fake).start()
+        patch.object(self.agent, "start_refresh", return_value={"status": "checking"}).start()
+        self.addCleanup(patch.stopall)
+        self.status()
+        self.original = self.compose.read_bytes()
+        self.edit("restart: unless-stopped", "restart: always")
+        self.desired = self.compose.read_bytes()
+        self.peer = self.make_service(self.current_hash("redis"), container_id="b" * 64, name="redis",
+                                      compose_service="redis", image="redis:7")
+
+    def review(self, action):
+        return self.agent.compose_reconcile_review(
+            {"service_key": "container/" + "a" * 64, "action": action, "requested_by": "admin"})
+
+    def fence_peer(self):
+        insert_fence(self.state, OP_1, self.peer, lifecycle="manual")
+
+    def test_discard_cannot_rewrite_a_fenced_peers_shared_source(self):
+        reviewed = self.review("discard")
+        self.fence_peer()
+        operation = self.execute(reviewed)
+        self.assertEqual(operation["status"], "blocked")
+        self.assertEqual(self.compose.read_bytes(), self.desired)
+        self.assertEqual(self.fake.up_calls, [])
+        self.assertEqual(list((self.state.root / "compose-recoveries").glob("*")), [])  # refused before the bundle
+
+    def test_apply_recovery_cannot_restore_over_a_fenced_peers_shared_source(self):
+        def hook(number, fresh):
+            if number == 1:
+                self.fence_peer()
+                fresh.health = "unhealthy"
+        self.fake.up_hook = hook
+        operation = self.execute(self.review("apply"))
+        self.assertTrue(operation["result"]["manual_recovery_required"])
+        self.assertFalse(operation["result"]["recovered"])
+        self.assertEqual(len(self.fake.up_calls), 1)
+        self.assertEqual(self.compose.read_bytes(), self.desired)
+
+    def test_sibling_apply_that_writes_no_source_keeps_its_behaviour(self):
+        self.fence_peer()
+        operation = self.execute(self.review("apply"))
+        self.assertEqual(operation["status"], "succeeded")
+        self.assertEqual(self.compose.read_bytes(), self.desired)
+
+
+class ClaimOwnerEvidenceTests(Base):
+    """Retention trusts a claim only when its owning fence fully validates."""
+
+    skipped = DeletionTests.skipped
+
+    def setUp(self):
+        super().setUp()
+        from test_disk_retention import Cfg
+        self.state = State(self.state_dir)
+        self.cfg = Cfg(self.root)
+        self.service = compose_service(self.root)
+        self.docker = _Docker()
+        for target in ("docker_update_manager.retention.run", "docker_update_manager.removal.run"):
+            patcher = patch(target, self.docker)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def corrupt_cases(self):
+        good = {"version": 1, "working_dir": self.service.working_dir, "compose_files": self.service.compose_files}
+        other = compose_service(self.root, name="other")
+        return {
+            "malformed json": dict(evidence="{not json"),
+            "wrong logical key": dict(key="f" * 64),
+            "inconsistent compose service": dict(key=logical_key("media", "other", other.working_dir,
+                                                                 other.compose_files)),
+            "inconsistent stack": dict(raw="UPDATE completion_fences SET stack=''"),
+            "unsupported evidence version": dict(evidence=json.dumps({**good, "version": 2})),
+            "invalid lifecycle": dict(raw="UPDATE completion_fences SET lifecycle='paused'"),
+            "invalid action": dict(raw="UPDATE completion_fences SET action='deploy'"),
+            "invalid owner": dict(raw="UPDATE completion_fences SET operation_id='not-an-owner'"),
+            "missing owner": dict(orphan=True),
+        }
+
+    def corrupt_state(self, name, case):
+        state = State(self.root / name.replace(" ", "-"))
+        if case.get("orphan"):
+            insert_fence(state, OP_2, self.service)
+            raw(state, ("DROP TRIGGER completion_fence_claims_unresolved_owner",),
+                ("INSERT INTO completion_fence_claims VALUES(?,?,?)", (OP_1, "image", IMAGE_A)),
+                ("INSERT INTO completion_fence_claims VALUES(?,?,?)", (OP_1, "backup", "backups/claimed")))
+        else:
+            insert_fence(state, OP_1, self.service, evidence=case.get("evidence"), key=case.get("key"))
+            insert_claim(state, OP_1, "image", IMAGE_A)
+            insert_claim(state, OP_1, "backup", "backups/claimed")
+        if case.get("raw"):
+            with contextlib.closing(sqlite3.connect(state.db_path)) as c:
+                c.execute("PRAGMA ignore_check_constraints=ON")
+                for trigger in ("completion_fences_identity_immutable", "completion_fence_claims_immutable"):
+                    c.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+                c.execute(case["raw"])
+                c.commit()
+        claimed = state.root / "backups" / "claimed"
+        claimed.mkdir(parents=True)
+        os.utime(claimed, (0, 0))
+        old_history(state, IMAGE_A)
+        return state, claimed
+
+    def test_unverifiable_owner_keeps_claimed_images_and_backups_under_all_retention_modes(self):
+        for name, case in self.corrupt_cases().items():
+            for options in ({}, {"service": "app", "stack": "media", "override_protection": True},
+                            {"all_protected": True}):
+                with self.subTest(name, options=options):
+                    state, claimed = self.corrupt_state(f"{name} {len(options)}", case)
+                    with self.assertRaisesRegex(CompletionFenceError, "completion_evidence_invalid"):
+                        state.completion_claims()
+                    self.docker.calls.clear()
+                    result = retention.cleanup(self.cfg, state, now=datetime.now(timezone.utc), **options)
+                    self.assertNotIn(IMAGE_A, self.docker.removed)
+                    self.assertTrue(claimed.exists())
+                    self.assertEqual(self.skipped(result)[IMAGE_A], "SKIPPED - RECOVERY CLAIMS UNVERIFIABLE")
+                    listed = {Path(a["path"]).name: a for a in retention.inventory(self.cfg, state)["artifacts"]}
+                    self.assertEqual((listed["claimed"]["expired"], listed["claimed"]["protection"]),
+                                     (False, "unverifiable"))
+                    self.assertNotIn(str(self.service.working_dir), json.dumps(result))
+
+    def test_unverifiable_owner_refuses_dangling_cleanup_and_remove_images(self):
+        from docker_update_manager import cli, removal
+        for name, case in self.corrupt_cases().items():
+            with self.subTest(name):
+                state, _claimed = self.corrupt_state(name, case)
+                docker = _Docker([IMAGE_A, IMAGE_B])
+                err = io.StringIO()
+                with patch.dict(os.environ, {"UPT_STATE_DIR": str(state.root)}), patch.object(cli, "run", docker), \
+                        patch("docker_update_manager.retention.run", docker), \
+                        patch.object(cli, "quick_snapshot", lambda *a, **k: None), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(cli.main(["cleanup", "--yes"]), cli.EXIT_FATAL)
+                self.assertEqual(docker.removed, [])
+                self.assertNotIn(str(self.service.working_dir), err.getvalue())
+                solo = compose_service(self.root, name="solo", image_id=IMAGE_A)
+                solo.stack = solo.compose_service = solo.working_dir = None
+                solo.compose_files = []
+                self.docker.calls.clear()
+                with patch("docker_update_manager.removal.require_mutation_safe"), \
+                        patch("docker_update_manager.removal._remaining_container_images", return_value=set()), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        result = removal.remove_service(solo, state, images=True, yes=True,
+                                                        reporter=Reporter(enabled=False), reconcile_discover=lambda: [])
+                    except CompletionFenceError:
+                        self.assertEqual(self.docker.calls, [])  # refused before any Docker effect
+                    else:
+                        self.assertIn(IMAGE_A, [image for image, _reason in result["skipped"]])
+                self.assertEqual(self.docker.removed, [])
+
+    def test_valid_shared_owners_and_resolved_claims_keep_their_behaviour(self):
+        insert_fence(self.state, OP_1, self.service)
+        insert_claim(self.state, OP_1, "image", IMAGE_A)
+        insert_fence(self.state, OP_2, compose_service(self.root, name="worker"), lifecycle="manual")
+        insert_claim(self.state, OP_2, "image", IMAGE_A)
+        done = "3" * 32
+        insert_fence(self.state, done, compose_service(self.root, name="done"), evidence="{not json")
+        insert_claim(self.state, done, "image", IMAGE_B)
+        resolve(self.state, done)  # a resolved owner's evidence no longer participates
+        self.assertEqual(self.state.completion_claims()["image"], frozenset({IMAGE_A}))
+        old_history(self.state, IMAGE_A)
+        old_history(self.state, IMAGE_B)
+        result = retention.cleanup(self.cfg, self.state, now=datetime.now(timezone.utc))
+        self.assertEqual(self.docker.removed, [IMAGE_B])
+        self.assertEqual(self.skipped(result)[IMAGE_A], "SKIPPED - UNRESOLVED RECOVERY CLAIM")
 
 
 if __name__ == "__main__":
